@@ -1,0 +1,50 @@
+# Lab content must never land in this repo. See tests/no-lab-content.sh,
+# which fails CI if any of these are committed anyway (gitignore alone is
+# defeated by `git add -f`).
+*.s
+*.o
+*.elf
+*.srec
+*.sof
+*.qpf
+*.qsf
+*.sdc
+*.v
+*.sv
+*.rbf
+*.pof
+
+# Tool droppings. Questa writes these into whatever directory it is
+# started in, which since the tools became directory-aware is your lab
+# folder - and if that is a repo you submit, they would go with it.
+transcript
+transcript[0-9]*
+vsim.wlf
+vsim_stacktrace.vstf
+modelsim.ini
+work/
+output_files/
+db/
+incremental_db/
+*_rtl.svg
+*.vcd
+
+# Build and run artifacts
+.run/
+niosv.cfg
+__pycache__/
+*.pyc
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Local config lives in ~/.config/cpen-tools/config, never here
+config
+
+# My verification log for SETUP.md, not for readers of the repo
+docs/SETUP-outline.md
+
+# Left behind by the RISC-V debug server in whatever folder it runs in
+gdbopxdriscv.ini

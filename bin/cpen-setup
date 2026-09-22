@@ -1,0 +1,494 @@
+#!/usr/bin/env bash
+#
+# cpen-setup - run the install guide, as far as it can be automated.
+#
+# Two steps cannot be scripted and this stops for each with instructions:
+#   1. downloading the Quartus installer (behind a login)
+#   2. requesting the Questa licence    (a web form)
+#
+# Safe to run repeatedly. Every step checks whether it is already done, so
+# after a failure you fix the cause and run it again.
+#
+#   cpen-setup                everything
+#   cpen-setup --no-gui       skip the VNC desktop
+#   cpen-setup --no-native    skip Surfer
+#   cpen-setup --check        report only, change nothing
+#   cpen-setup --report       --check plus your versions, for an issue
+#   cpen-setup --config-only  just re-detect and rewrite the config
+#   cpen-setup --no-path      do not touch your shell profile
+#
+set -uo pipefail
+
+MACHINE="${CPEN_VM:-altera}"
+INSTALL_DIR=/opt/altera
+INSTALLER=qinst-lite-linux-24.1std-1077.run
+INSTALLER_SHA1=03b7abe3990ce26a70bd953253e7c8a6923126cc
+# Pinned to a revision, and checked before it runs. This is third-party
+# code executed as root against a library in /opt, and the unpinned raw URL
+# serves whatever the gist says at the moment you install: the author can
+# change it, and it has already been revised three times. A pinned URL
+# cannot change under us, and the checksum means a wrong answer stops the
+# install instead of running.
+#
+# To adopt a newer revision: read the diff first, then update both lines.
+#   gh api gists/15d8c6568bc4a97b2fa39fc8125375f8 --jq '.history[0].version'
+PATCH_REV=09579d6b8623821d3d6b5078750d45bc74380544
+PATCH_URL=https://gist.githubusercontent.com/Lama3L9R/15d8c6568bc4a97b2fa39fc8125375f8/raw/$PATCH_REV/patch-libccl_sqlite.js
+PATCH_SHA256=36d37a72c80069283d1f8766c2aea67511dacb3ce7cc26595f8ee01428fc0bed
+REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
+CONFIG_FILE="${CPEN_TOOLS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/cpen-tools/config}"
+CONFIG_HOME=$(dirname "$CONFIG_FILE")
+
+DO_GUI=1 DO_NATIVE=1 CHECK_ONLY=0 CONFIG_ONLY=0 REPORT=0
+CONFIGURE_ARGS="" CHECK_ARGS=""
+for a in "$@"; do
+  case "$a" in
+    --no-gui)      DO_GUI=0; CHECK_ARGS="$CHECK_ARGS --no-gui" ;;
+    --no-native)   DO_NATIVE=0; CHECK_ARGS="$CHECK_ARGS --no-native" ;;
+    --check)       CHECK_ONLY=1 ;;
+    --report)      CHECK_ONLY=1; REPORT=1 ;;
+    --config-only) CONFIG_ONLY=1 ;;
+    --no-path)     CONFIGURE_ARGS="$CONFIGURE_ARGS --no-path" ;;
+    -h|--help)     sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $a (try --help)" >&2; exit 2 ;;
+  esac
+done
+
+# No escapes when the output is not a terminal, so a redirected or pasted
+# report does not arrive full of [32m.
+if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ]; then
+  B= R= G= Y= C= N= LINKS=0
+else
+  B=$'\033[1m' R=$'\033[31m' G=$'\033[32m' Y=$'\033[33m' C=$'\033[36m' N=$'\033[0m'
+  LINKS=1
+fi
+
+# OSC 8, with the URL as its own link text. Terminals that understand it
+# (iTerm2, WezTerm, kitty, VS Code) make it a real link; the ones that do
+# not swallow the escape and show the plain URL, which macOS Terminal
+# already makes cmd-clickable. Either way the address stays visible, which
+# is why the link text is never something like "here".
+link() {
+  if [ "$LINKS" = 1 ]; then
+    printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$1" "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+# A box sized to its own contents, so the border still meets when the
+# wording changes. Padding is measured on the plain text: the escapes in a
+# hyperlink take no width on screen but plenty in ${#var}.
+box() {  # box <line>...  where a line may be "text<TAB>url"
+  local l w=0 text url
+  for l in "$@"; do
+    text=${l%%$'\t'*}; url=${l#*$'\t'}; [ "$url" = "$l" ] && url=""
+    [ $(( ${#text} + ${#url} )) -gt "$w" ] && w=$(( ${#text} + ${#url} ))
+  done
+  w=$(( w + 4 ))
+  printf '%*s\n' "$w" '' | tr ' ' '#'
+  for l in "$@"; do
+    text=${l%%$'\t'*}; url=${l#*$'\t'}; [ "$url" = "$l" ] && url=""
+    printf '# %s' "$text"
+    [ -n "$url" ] && link "$url"
+    printf '%*s #\n' $(( w - 4 - ${#text} - ${#url} )) ''
+  done
+  printf '%*s\n' "$w" '' | tr ' ' '#'
+}
+step()  { printf '\n%s%s%s\n' "$B" "$*" "$N"; }
+ok()    { printf '  %sok%s    %s\n' "$G" "$N" "$*"; }
+doing() { printf '  %s..%s    %s\n' "$C" "$N" "$*"; }
+warn()  { printf '  %swarn%s  %s\n' "$Y" "$N" "$*"; }
+bad()   { printf '  %sno%s    %s\n' "$R" "$N" "$*"; }
+# Under --check and --report nothing is being installed, so a step that
+# would stop the run says so and carries on. A report that ends at the
+# first missing prerequisite is no use, and that is the machine most likely
+# to be sending one.
+halt() {
+  if [ "$CHECK_ONLY" = 1 ]; then
+    FAILED=1
+    printf '  %sstop%s  %s\n' "$Y" "$N" "$1"; shift
+    printf '%s\n' "$@" | sed 's/^/        /'
+    return 0
+  fi
+  printf '\n%s%sStopped:%s %s\n' "$B" "$Y" "$N" "$1"; shift
+  printf '%s\n' "$@"
+  exit 3
+}
+
+FAILED=0
+vm()    { orb -m "$MACHINE" bash -c "$1" < /dev/null; }
+
+if [ "$CONFIG_ONLY" = 1 ]; then
+  exec "$REPO_DIR/lib/configure.sh" $CONFIGURE_ARGS
+fi
+
+vm_ok() { orb -m "$MACHINE" bash -c "$1" < /dev/null >/dev/null 2>&1; }
+have()  { command -v "$1" >/dev/null 2>&1; }
+skip()  { [ "$CHECK_ONLY" = 1 ]; }
+
+# -------------------------------------------------------------- report ---
+# One block to paste into an issue: what this machine is, then what every
+# check says. Changes nothing, and asks the VM for nothing it is not
+# already running.
+if [ "$REPORT" = 1 ]; then
+  cfg() { sed -n "s/^$1='\(.*\)'$/\1/p" "$CONFIG_FILE" 2>/dev/null | tail -1; }
+  q() { printf '%s' "${1:-unknown}"; }
+
+  echo '```'
+  printf 'cpen-tools report\n\n'
+  printf '  Mac         %s (%s)\n' \
+    "$(q "$(sysctl -n hw.model 2>/dev/null)")" "$(uname -m)"
+  printf '  macOS       %s (%s)\n' \
+    "$(q "$(sw_vers -productVersion 2>/dev/null)")" \
+    "$(q "$(sw_vers -buildVersion 2>/dev/null)")"
+  printf '  OrbStack    %s\n' \
+    "$(q "$(orb version 2>/dev/null | head -1 | sed 's/^Version: *//')")"
+  printf '  Python      %s\n' "$(q "$(python3 -V 2>&1 | awk '{print $2}')")"
+  printf '  cpen-tools  %s\n' \
+    "$(q "$(git -C "$REPO_DIR" describe --always --dirty 2>/dev/null)")"
+  if vm_ok true; then
+    printf '  VM          %s\n' \
+      "$(q "$(vm '. /etc/os-release && printf "%s" "$PRETTY_NAME"' 2>/dev/null)")"
+    printf '  kernel      %s\n' "$(q "$(vm 'uname -r' 2>/dev/null)")"
+    printf '  Quartus     %s\n' \
+      "$(q "$(vm "$INSTALL_DIR/quartus/bin/quartus_sh --version 2>/dev/null | sed -n 2p" 2>/dev/null)")"
+  else
+    printf '  VM          not reachable (machine %s)\n' "$MACHINE"
+  fi
+  printf '  board       %s\n' "$(q "$(cfg BOARD)")"
+  printf '  cable       %s\n' "$(q "$(cfg CABLE)")"
+
+  # The same checks, uncoloured, with the home directory taken out: this
+  # gets pasted in public. The awk holds blank lines back until something
+  # follows them, so the fence does not end on a gap.
+  out=$(NO_COLOR=1 "$0" --check $CHECK_ARGS 2>&1); rc=$?
+  printf '%s\n' "$out" \
+    | awk '/^  Next:/{exit} /^[[:space:]]*$/{b++;next}
+           {while(b-->0)print ""; b=0; print}' \
+    | sed -e "s|$HOME|~|g" -e "s|$(id -un)|<user>|g"
+  echo '```'
+  printf '\nPaste that into your issue. It contains no licence file, no\n'
+  printf 'password and no username.\n'
+  exit "$rc"
+fi
+
+# ---------------------------------------------------------------- mac ---
+step "Mac tools"
+
+if xcode-select -p >/dev/null 2>&1; then ok "Xcode Command Line Tools"
+else
+  bad "Xcode Command Line Tools missing"
+  skip || { doing "opening the installer"; xcode-select --install 2>/dev/null; }
+  halt "Command Line Tools are installing." \
+       "Click through the installer, wait for it to finish, then run cpen-setup again."
+fi
+
+if [ "$(uname -m)" = "arm64" ]; then
+  if /usr/bin/pgrep -q oahd || [ -d /Library/Apple/usr/share/rosetta ]; then ok "Rosetta 2"
+  else
+    bad "Rosetta 2 missing"
+    skip || {
+      doing "installing Rosetta (no password needed)"
+      # Keep the output: a swallowed failure here leaves someone with a bare
+      # "failed" and nothing to act on.
+      rosetta_err=$(softwareupdate --install-rosetta --agree-to-license 2>&1 >/dev/null)
+      if [ -d /Library/Apple/usr/share/rosetta ] || /usr/bin/pgrep -q oahd; then
+        ok "Rosetta 2 installed"
+      else
+        bad "Rosetta install failed"
+        printf '%s\n' "$rosetta_err" | tail -3 | sed 's/^/        /'
+        printf '        run it yourself and read the error:\n'
+        printf '          softwareupdate --install-rosetta --agree-to-license\n'
+        FAILED=1
+      fi
+    }
+  fi
+else ok "Intel Mac, Rosetta not needed"; fi
+
+if have brew; then ok "Homebrew"
+else
+  bad "Homebrew missing"
+  halt "Homebrew is needed for OrbStack and Surfer." \
+       '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"' \
+       "Then run cpen-setup again."
+fi
+
+if have orb; then ok "OrbStack $(orb version 2>/dev/null | head -1)"
+else
+  bad "OrbStack missing"
+  skip || { doing "brew install --cask orbstack"; brew install --cask orbstack >/dev/null 2>&1; }
+  have orb || halt "OrbStack needs to be opened once before its command appears." \
+                   "Open the OrbStack app, then run cpen-setup again."
+fi
+
+if [ "$DO_NATIVE" = 1 ]; then
+  if have surfer; then ok "Surfer"
+  else
+    bad "Surfer missing [native]"
+    skip || { doing "brew install surfer"; brew install surfer >/dev/null 2>&1 \
+              && ok "Surfer installed" || { warn "Surfer install failed; WAVE will not open"; FAILED=1; }; }
+  fi
+fi
+
+# ------------------------------------------------------------ the vm ---
+step "Linux machine '$MACHINE'"
+
+if orb list 2>/dev/null | awk '{print $1}' | grep -qx "$MACHINE"; then
+  ok "exists"
+else
+  bad "does not exist"
+  skip || { doing "orb create -a amd64 ubuntu $MACHINE"
+            orb create -a amd64 ubuntu "$MACHINE" >/dev/null 2>&1 \
+              && ok "created" || { bad "could not create it"; exit 1; }; }
+fi
+# Reachability is checked even under --check. Without it every VM probe
+# below returns an empty string, which the tests below read as a pass, and
+# a report from a machine with no VM comes back looking healthy.
+if vm_ok true; then
+  VM_UP=1
+else
+  VM_UP=0
+  bad "cannot reach the VM"
+  skip || exit 1
+fi
+
+PKGS="build-essential git usbutils libarchive-tools libfontconfig1 libxft2 libxext6 nodejs unzip"
+[ "$DO_GUI" = 1 ] && PKGS="$PKGS tigervnc-standalone-server openbox wmctrl x11-xserver-utils fonts-dejavu fonts-liberation2 fonts-noto-core"
+
+MISSING=$(vm "for p in $PKGS; do dpkg -s \$p >/dev/null 2>&1 || printf '%s ' \$p; done" 2>/dev/null)
+if [ "$VM_UP" = 0 ]; then warn "packages not checked, no VM"
+elif [ -z "$MISSING" ]; then ok "packages present"
+else
+  bad "missing: $MISSING"
+  skip || { doing "apt-get update (this is why stale indexes 404)"
+            vm "sudo apt-get update -qq" >/dev/null 2>&1
+            doing "installing"
+            vm "sudo apt-get install -y -qq $MISSING" >/dev/null 2>&1 \
+              && ok "packages installed" || { bad "apt install failed"; FAILED=1; }; }
+fi
+
+FREE=$(vm "df -BG --output=avail / | tail -1 | tr -dc '0-9'" 2>/dev/null)
+if [ -z "$FREE" ]; then warn "disk space not checked, no VM"
+elif [ "$FREE" -lt 26 ]; then
+  warn "only ${FREE}GB free in the VM; the install needs about 26GB"
+else ok "disk space (${FREE}GB free)"; fi
+
+# --------------------------------------------------------- toolchain ---
+step "Quartus toolchain"
+
+if vm_ok "[ -x $INSTALL_DIR/quartus/bin/quartus_sh ]"; then
+  ok "Quartus installed"
+else
+  bad "Quartus not installed"
+  DL="$HOME/Downloads/$INSTALLER"
+  if [ ! -f "$DL" ]; then
+    halt "The Quartus installer has to be downloaded by hand; it is behind a login." \
+         "  1. make a free account at https://www.altera.com" \
+         "  2. download Quartus Prime Lite 24.1 for LINUX, the Installer (SFX) tab" \
+         "  3. leave $INSTALLER in your Downloads folder" \
+         "Then run cpen-setup again."
+  elif ! echo "$INSTALLER_SHA1  $DL" | shasum -a 1 -c >/dev/null 2>&1; then
+    halt "The installer in Downloads does not match the expected checksum." \
+         "It is probably a partial download or the wrong file. Delete and re-download it."
+  else
+    ok "installer present and intact"
+    skip || {
+    doing "unpacking (a minute)"
+    vm "mkdir -p ~/quartus-install && cd ~/quartus-install &&
+        cp '$HOME/Downloads/$INSTALLER' . &&
+        F=$INSTALLER &&
+        skip=\$(head -c 4000 \"\$F\" | strings | sed -n 's/^skip=\"\\([0-9]*\\)\"/\\1/p' | head -1) &&
+        tail -n +\$((skip + 1)) \"\$F\" | gzip -dc | bsdtar -xf -" >/dev/null 2>&1 \
+      || { bad "unpacking failed"; exit 1; }
+    doing "installing Quartus and Questa (about 10 minutes)"
+    vm "sudo mkdir -p $INSTALL_DIR && cd ~/quartus-install &&
+        sudo ./qinst.sh --auto-install --download-dir ~/qinst-dl \
+          --install-dir $INSTALL_DIR --accept-eula --cli" >/dev/null 2>&1
+    vm_ok "[ -x $INSTALL_DIR/quartus/bin/quartus_sh ]" \
+      && ok "Quartus installed" || { bad "install failed; see the guide's troubleshooting"; exit 1; }
+    }
+  fi
+fi
+
+if vm_ok "$INSTALL_DIR/quartus/bin/quartus_sh --version"; then
+  ok "Quartus runs (Rosetta fix applied)"
+else
+  bad "Quartus dies with Illegal Instruction"
+  skip || {
+    doing "applying the Rosetta compatibility fix"
+    # One download, verified before it is run, and run on each match in
+    # turn since the script takes a single path and ignores the rest.
+    # Distinct exit codes so a checksum failure does not look like a
+    # patch that simply did not work.
+    vm "set -e
+        d=\$(mktemp -d) && cd \"\$d\"
+        curl -fsSL '$PATCH_URL' -o patch.js || exit 10
+        echo '$PATCH_SHA256  patch.js' | sha256sum -c --status || exit 11
+        find $INSTALL_DIR -name libccl_sqlite3.so -exec sudo node patch.js {} \;" \
+      >/dev/null 2>&1
+    case $? in
+      10) bad "could not download the Rosetta patch"
+          printf '        %s\n' "$PATCH_URL"
+          printf '        nothing was run. Check your network and try again.\n'
+          FAILED=1 ;;
+      11) bad "the Rosetta patch did not match its checksum; nothing was run"
+          printf '        expected sha256 %s\n' "$PATCH_SHA256"
+          printf '        The pinned revision should never change. Please report this\n'
+          printf '        rather than working around it.\n'
+          FAILED=1 ;;
+      *)  vm_ok "$INSTALL_DIR/quartus/bin/quartus_sh --version" \
+            && ok "patched" || { bad "patch did not take"; FAILED=1; } ;;
+    esac
+  }
+fi
+
+if vm_ok "[ -x $INSTALL_DIR/riscfree/toolchain/riscv32-unknown-elf/bin/riscv32-unknown-elf-gcc ]"; then
+  ok "RISC-V compiler"
+else
+  bad "RISC-V compiler missing"
+  skip || {
+    doing "installing riscfree (0.84GB, about 3 minutes)"
+    vm "cd ~/quartus-install && sudo ./qinst.sh --components riscfree \
+        --download-dir ~/qinst-dl --install-dir $INSTALL_DIR --accept-eula --cli" >/dev/null 2>&1
+    vm_ok "[ -x $INSTALL_DIR/riscfree/toolchain/riscv32-unknown-elf/bin/riscv32-unknown-elf-gcc ]" \
+      && ok "riscfree installed" || { bad "riscfree install failed"; FAILED=1; }
+  }
+fi
+
+# Only once everything that needs them is installed: riscfree is a second
+# pass over the same unpacked installer, so this cannot run any earlier.
+LEFTOVER=$(vm "du -sm ~/quartus-install ~/qinst-dl 2>/dev/null | awk '{t+=\$1} END {print t+0}'" 2>/dev/null)
+if [ "${LEFTOVER:-0}" -lt 1 ]; then
+  ok "no installer downloads left over"
+elif skip; then
+  warn "${LEFTOVER}MB of installer downloads could be reclaimed"
+elif [ "$FAILED" = 0 ]; then
+  doing "removing ${LEFTOVER}MB of installer downloads"
+  # sudo: qinst.sh runs under sudo and the download directory comes out
+  # owned by root, so a plain rm as the ordinary user cannot touch it.
+  vm "sudo rm -rf ~/quartus-install ~/qinst-dl" >/dev/null 2>&1 \
+    && ok "reclaimed ${LEFTOVER}MB" \
+    || warn "could not remove them; try: orb -m $MACHINE sudo rm -rf '~/quartus-install' '~/qinst-dl'"
+else
+  warn "${LEFTOVER}MB of installer downloads kept, since something above failed"
+fi
+
+# ------------------------------------------------------ path and udev ---
+step "PATH and board access"
+
+if vm_ok "grep -q QUARTUS_ROOTDIR ~/.bashrc"; then ok "PATH set in ~/.bashrc"
+else
+  bad "PATH not set"
+  skip || { vm "cat >> ~/.bashrc <<'LINE'
+
+# Altera toolchain
+export QUARTUS_ROOTDIR=$INSTALL_DIR/quartus
+export PATH=\"\$QUARTUS_ROOTDIR/bin:$INSTALL_DIR/niosv/bin:$INSTALL_DIR/riscfree/toolchain/riscv32-unknown-elf/bin:\$PATH\"
+LINE" >/dev/null 2>&1 && ok "PATH added" || { bad "could not edit ~/.bashrc"; FAILED=1; }; }
+fi
+
+RULES=/etc/udev/rules.d/51-altera-usb-blaster.rules
+if vm_ok "[ -f $RULES ]"; then ok "udev rule installed"
+else
+  bad "udev rule missing"
+  skip || {
+    vm "sudo tee $RULES > /dev/null <<'RULE'
+# Altera USB-Blaster (DE10-Lite, DE1-SoC on-board)
+SUBSYSTEM==\"usb\", ATTR{idVendor}==\"09fb\", ATTR{idProduct}==\"6001\", MODE=\"0666\"
+SUBSYSTEM==\"usb\", ATTR{idVendor}==\"09fb\", ATTR{idProduct}==\"6002\", MODE=\"0666\"
+SUBSYSTEM==\"usb\", ATTR{idVendor}==\"09fb\", ATTR{idProduct}==\"6003\", MODE=\"0666\"
+SUBSYSTEM==\"usb\", ATTR{idVendor}==\"09fb\", ATTR{idProduct}==\"6010\", MODE=\"0666\"
+SUBSYSTEM==\"usb\", ATTR{idVendor}==\"09fb\", ATTR{idProduct}==\"6810\", MODE=\"0666\"
+RULE
+        sudo udevadm control --reload-rules && sudo udevadm trigger" >/dev/null 2>&1 \
+      && ok "udev rule installed" || { bad "could not write the udev rule"; FAILED=1; }
+  }
+fi
+
+# ------------------------------------------------------------- gui ---
+if [ "$DO_GUI" = 1 ]; then
+  step "GUI desktop [gui]"
+  vm_ok "command -v Xvnc" && ok "VNC server present" || { bad "VNC server missing"; FAILED=1; }
+# TigerVNC moved the password file to the XDG location; Ubuntu 26.04
+# ships a version that writes ~/.config/tigervnc/passwd, while older ones
+# used ~/.vnc/passwd. Accept either, or a password that was set comes back
+# as "not set".
+VNC_PASSWD_TEST='[ -f "$HOME/.vnc/passwd" ] || '\
+'[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/tigervnc/passwd" ]'
+  if vm_ok "$VNC_PASSWD_TEST"; then ok "VNC password set"
+  else
+    warn "no VNC password yet"
+    printf '        set one yourself (it is never stored by these tools):\n'
+    printf '          orb -m %s vncpasswd\n' "$MACHINE"
+  fi
+  FONTS=$(vm "fc-list 2>/dev/null | wc -l" 2>/dev/null)
+  [ "${FONTS:-0}" -gt 100 ] && ok "fonts ($FONTS files)" \
+    || warn "only ${FONTS:-0} font files; Quartus text will look poor"
+fi
+
+# -------------------------------------------------------- licence ---
+step "Questa licence"
+
+LEGACY_LIC="${XDG_CONFIG_HOME:-$HOME/.config}/fpga-console/Questa_License.dat"
+if [ -f "$CONFIG_HOME/Questa_License.dat" ]; then
+  ok "licence file present"
+elif [ -f "$LEGACY_LIC" ]; then
+  ok "licence found in the old fpga-console folder"
+  printf '        it will be copied to %s; nothing for you to redo\n' "$CONFIG_HOME"
+else
+  NIC=$(vm "cat /sys/class/net/eth0/address 2>/dev/null | tr -d ':' | tr 'a-f' 'A-F'" 2>/dev/null)
+  bad "no licence file"
+  printf '        Questa will not simulate without one. It is free:\n'
+  printf '          1. https://licensing.altera.com  (a separate account from the download site)\n'
+  printf '          2. Sign up for Evaluation or No-Cost Licenses, product SW-QUESTA\n'
+  printf '          3. Computer Type FIXED, License Type NIC ID\n'
+  printf '          4. Primary NIC ID: %s%s%s\n' \
+    "$B" "${NIC:-<run cpen-setup once the VM is up>}" "$N"
+  printf '          5. save the .dat as %s/Questa_License.dat\n' "$CONFIG_HOME"
+  printf '        Then run cpen-setup again.\n'
+  FAILED=1
+fi
+
+# --------------------------------------------------------- detect ---
+step "Detection and config"
+if skip; then
+  ok "skipped (--check)"
+else
+  "$REPO_DIR/lib/configure.sh" $CONFIGURE_ARGS || FAILED=1
+fi
+
+step "Result"
+if [ "$FAILED" = 0 ]; then
+  ok "everything the script can check is in place"
+  echo
+  # A plain block, not printf: this is the one screen every reader is
+  # guaranteed to see, and it should survive being edited by anyone.
+  D=https://github.com/Horse-5-333/cpen-tools/blob/main/docs
+  LINES=(
+    "Everything is installed. Get started with the following steps:"
+    ""
+    "  assembly (Nios V)   cd into your lab folder, then  cpen-nios  and press F1"
+    "  your own Verilog    cd into your lab folder, then  cpen-verilog for the commands"
+    ""
+    "Both work in the folder you run them from, and that folder has to be"
+    "somewhere under /Users so the VM can see it."
+    ""
+    "First time with a Verilog lab:  cpen-verilog NEWPROJECT TOP=<your module>"
+    "When something stops working:   cpen-setup --check"
+  )
+  # Only when the desktop was actually installed: --no-gui leaves no VNC
+  # server, and cpen-gui would fail for anyone told to run it.
+  [ "$DO_GUI" = 1 ] && LINES+=("Viewing Quartus and Questa:     cpen-gui both")
+  LINES+=(
+    ""
+    "Further documentation for"
+    "Setup:           $(printf '\t')$D/SETUP.md"
+    "Reference:       $(printf '\t')$D/REFERENCE.md"
+    "Troubleshooting: $(printf '\t')$D/TROUBLESHOOTING.md"
+  )
+  box "${LINES[@]}"
+else
+  warn "some steps still need you; see above, then run cpen-setup again"
+  exit 1
+fi

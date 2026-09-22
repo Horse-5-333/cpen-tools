@@ -1,0 +1,1436 @@
+#!/usr/bin/env python3
+"""
+cpen-nios - a console for the CPEN 211 FPGA toolchain on macOS.
+
+Drives an OrbStack Linux VM holding Quartus and the Nios V tools, so the
+board can be brought up, programmed, built and run from one screen.
+
+    ┌─ OrbStack ───────────────────────────────────────────────┐
+    │  you@vm:~/CPEN211/lab0$ labmake COMPILE                  │
+    └──────────────────────────────────────────────────────────┘
+    ┌─ FPGA StdOut (Read Only) ───┬─ GDB Server (Read Only) ───┐
+    └─────────────────────────────┴────────────────────────────┘
+     F1 Init  F2 Prog ...              vm● usb● jtag●    READY
+
+The top pane is a real shell on the VM, held open for the whole session,
+so commands start instantly and cd persists. The bottom panes are
+read-only tails of the terminal and debug-server logs.
+
+It opens in the directory you run it from; F7 moves somewhere else.
+
+Board and install location come from ~/.config/cpen-tools/config - run
+cpen-setup to write it.
+
+No third-party packages. curses only.
+"""
+
+import curses
+import glob
+import locale
+import os
+import queue
+import re
+import shutil
+import subprocess
+import threading
+import time
+from collections import deque
+
+# curses needs the locale set before it can put non-ASCII on the screen.
+# Without this the box-drawing characters and the status glyphs come out
+# broken, which looks like the frames failing to join up.
+locale.setlocale(locale.LC_ALL, "")
+
+# ----------------------------------------------------------------- config ---
+# Everything machine-specific comes from ~/.config/cpen-tools/config,
+# written by cpen-setup from lib/detect.sh. Nothing here is hardcoded to one
+# student's paths or to one board.
+
+HOME     = os.path.expanduser("~")
+# realpath, not abspath: launched through a symlink or a wrapper in
+# ~/.local/bin, abspath would resolve the repo to that directory instead.
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+CONFIG_FILE = os.environ.get(
+    "CPEN_TOOLS_CONFIG",
+    os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")),
+                 "cpen-tools", "config"))
+
+
+def load_config(path):
+    """Read the shell-sourceable KEY='value' file cpen-setup writes.
+
+    Deliberately not a shell invocation: this runs before curses starts and
+    must not be able to execute anything the file happens to contain.
+    """
+    cfg = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k = k.strip()
+                if not k.replace("_", "").isalnum():
+                    continue
+                v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in "\'\"":
+                    v = v[1:-1]
+                cfg[k] = os.path.expandvars(os.path.expanduser(v))
+    except OSError:
+        pass
+    return cfg
+
+
+CFG = load_config(CONFIG_FILE)
+
+
+def cfg(key, default=""):
+    return CFG.get(key) or default
+
+
+# ORBSTACK_VM_NAME is the documented name; MACHINE is kept as an alias so
+# configs written before the rename keep working.
+MACHINE  = cfg("ORBSTACK_VM_NAME") or cfg("MACHINE", "altera")
+INSTALL  = cfg("INSTALL", "/opt/altera")
+QUARTUS_BIN = cfg("QUARTUS_BIN", INSTALL + "/quartus/bin")
+NIOSV_BIN   = cfg("NIOSV_BIN",   INSTALL + "/niosv/bin")
+RISCV_BIN   = cfg("RISCV_BIN",   INSTALL + "/riscfree/toolchain/riscv32-unknown-elf/bin")
+GDBSRV_DIR  = INSTALL + "/riscfree/debugger/gdbserver-riscv"
+
+INIT_SH  = cfg("INIT_SH",  os.path.join(REPO_DIR, "bin", "cpen-init"))
+MAKEFILE = cfg("MAKEFILE", os.path.join(REPO_DIR, "share", "Makefile.linux"))
+RUNDIR   = cfg("RUNDIR", os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local", "state")),
+    "cpen-tools"))
+TERM_LOG = os.path.join(RUNDIR, "terminal.log")
+GDB_LOG  = os.path.join(RUNDIR, "gdbserver.log")
+
+BOARD         = cfg("BOARD")
+EXPECT_IDCODE = cfg("IDCODE")
+JTAG_INDEX    = cfg("JTAG_INDEX", "1")
+SOF           = cfg("SOF")
+TOOLCHAIN     = cfg("TOOLCHAIN", "proprietary")
+QUESTA_BIN    = cfg("QUESTA_BIN", INSTALL + "/questa_fse/linux_x86_64")
+# Questa Starter is free but still needs a licence, and a non-interactive
+# shell would not see it from a profile, so it is exported here.
+SALT_LICENSE  = cfg("SALT_LICENSE_SERVER")
+GDB_PORT      = int(cfg("GDB_PORT", "2454"))
+
+POLL_SECS = 6.0
+MARK      = "__CPEN_NIOS_DONE__"
+
+
+def _vm_user():
+    """The username inside the VM, for the prompt. Not necessarily the
+    Mac's: OrbStack mirrors it by default, but nothing guarantees it."""
+    try:
+        r = subprocess.run(["orb", "-m", MACHINE, "bash", "-c", "id -un"],
+                           stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, timeout=10)
+        name = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
+        if name:
+            return name
+    except Exception:
+        pass
+    return os.environ.get("USER", "user")
+
+
+VM_USER = _vm_user()
+
+# A plain non-interactive bash does not read .bashrc, so the PATH the
+# student's shell would have is sent by hand when the shell opens. Built
+# from the detected install rather than assumed, and `labmake` is defined
+# here so it points at our Makefile whatever the student's own one says.
+SHELL_INIT = (
+    "export PATH=$PATH:" + ":".join([
+        QUARTUS_BIN, NIOSV_BIN, GDBSRV_DIR, RISCV_BIN,
+        INSTALL + "/quartus/sopc_builder/bin",
+        INSTALL + "/questa_fse/linux_x86_64",
+    ]) + "\n"
+    + f'export QUARTUS_ROOTDIR="{INSTALL}/quartus"\n'
+    + "labmake() { make -f '" + MAKEFILE + "' "
+      + " ".join(f"{k}='{v}'" for k, v in (
+          ("INSTALL", INSTALL), ("BOARD", BOARD), ("SOF", SOF),
+          ("JTAG_INDEX", JTAG_INDEX), ("GDB_PORT", str(GDB_PORT)),
+          ("TOOLCHAIN", TOOLCHAIN), ("QUESTA_BIN", QUESTA_BIN),
+          ("SALT_LICENSE_SERVER", SALT_LICENSE)) if v)
+      + ' "$@"; }\n'
+)
+
+# ncurses on macOS is built without BUTTON5_PRESSED, so wheel-down has no
+# name here. 0x200000 is its value where it exists; terminals that instead
+# translate the wheel into arrow keys are already handled by those.
+WHEEL_DOWN = getattr(curses, "BUTTON5_PRESSED", 0x200000)
+
+ANSI  = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\r")
+CTRL  = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+NOISE = ("cannot set terminal process group", "no job control in this shell")
+GDBNOISE = re.compile(r"^\[GDB server output\]\s*(Info\s*:.*)?$")
+STEP = re.compile(r"^==>\s*(.+)$")
+
+PHASES = [("OrbStack machine", "STARTING VM"), ("USB-Blaster", "ATTACHING"),
+          ("Releasing", "RELEASING"), ("JTAG chain", "SCANNING JTAG"),
+          ("Programming", "PROGRAMMING"), ("GDB server", "STARTING GDB"),
+          ("nios2-terminal", "STARTING TERM"), ("Stopping", "STOPPING"),
+          ("Status", "CHECKING")]
+
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def clean(s):
+    s = CTRL.sub("", ANSI.sub("", s)).rstrip("\n")
+    return "" if any(n in s for n in NOISE) else s
+
+
+def boring(s):
+    return bool(GDBNOISE.match(s))
+
+
+def sh(p):
+    return "'" + str(p).replace("'", "'\\''") + "'"
+
+
+# ------------------------------------------------------------------ panes ---
+class Pane:
+    def __init__(self, maxlen=4000):
+        self.lines = deque(maxlen=maxlen)
+        self.scroll = 0
+        self.lock = threading.Lock()
+        self.on_add = None
+        self.added = 0          # absolute count, so floor survives the deque
+        self.floor = 0          # absolute index where the current run began
+
+    def add(self, text):
+        new = str(text).split("\n")
+        with self.lock:
+            for ln in new:
+                self.lines.append(ln)
+                self.added += 1
+            if self.scroll:
+                self.scroll += 1
+
+    def set_floor(self):
+        """Start a clean screen: what follows sits at the top of the pane."""
+        with self.lock:
+            self.floor = self.added
+            self.scroll = 0
+
+    def floor_index(self):
+        """Where the floor is in the deque now that old lines have dropped."""
+        with self.lock:
+            return max(0, min(len(self.lines),
+                              self.floor - (self.added - len(self.lines))))
+        if self.on_add:                      # called outside the lock
+            for ln in new:
+                self.on_add(ln)
+
+    def clear(self):
+        with self.lock:
+            self.lines.clear()
+            self.scroll = 0
+            self.floor = self.added
+
+    def snapshot(self):
+        with self.lock:
+            return list(self.lines), self.scroll
+
+
+def wrap(line, width):
+    if width < 2:
+        return [""]
+    line = CTRL.sub("", line).expandtabs(8)
+    if not line:
+        return [""]
+    return [line[i:i + width] for i in range(0, len(line), width)]
+
+
+class Tailer(threading.Thread):
+    """follow -F, starting at end of file so the panes open empty."""
+
+    daemon = True
+
+    def __init__(self, path, pane):
+        super().__init__()
+        self.path, self.pane, self.stop = path, pane, False
+
+    def run(self):
+        pos, inode = None, None
+        while not self.stop:
+            try:
+                st = os.stat(self.path)
+                if inode != st.st_ino:
+                    inode = st.st_ino
+                    pos = st.st_size if pos is None else 0
+                if st.st_size < pos:
+                    pos = 0
+                if st.st_size > pos:
+                    with open(self.path, "r", errors="replace") as f:
+                        f.seek(pos)
+                        chunk = f.read()
+                        pos = f.tell()
+                    for ln in chunk.splitlines():
+                        self.pane.add(clean(ln))
+            except FileNotFoundError:
+                pos = 0
+            except Exception as e:
+                self.pane.add(f"[tailer: {e}]")
+            time.sleep(0.3)
+
+
+# --------------------------------------------------------------- VM shell ---
+class VMShell:
+    """One bash on the VM, held open for the session.
+
+    Spawning `orb -m altera bash -ic` per command costs about 220ms, which is
+    what made the console feel laggy. Reusing one shell makes a builtin
+    effectively instant and an external command about 20ms, and it means cd
+    persists the way it does in a real terminal.
+    """
+
+    def __init__(self, pane):
+        self.pane = pane
+        self.proc = None
+        self.q = queue.Queue()
+        self.cwd = None
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self, cwd):
+        self.stop()
+        try:
+            self.proc = subprocess.Popen(
+                ["orb", "-m", MACHINE, "bash"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, bufsize=1, errors="replace")
+        except FileNotFoundError:
+            self.pane.add("orb: command not found — is OrbStack installed?")
+            return False
+        threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
+        try:
+            self.proc.stdin.write(SHELL_INIT)
+            self.proc.stdin.write(f"cd {sh(cwd)} 2>/dev/null\n")
+            self.proc.stdin.flush()
+        except Exception:
+            return False
+        self.cwd = cwd
+        return True
+
+    def stop(self):
+        if self.proc:
+            try:
+                self.proc.stdin.write("exit\n")
+                self.proc.stdin.flush()
+            except Exception:
+                pass
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+        self.proc = None
+
+    def _reader(self, proc):
+        for ln in proc.stdout:
+            self.q.put(ln.rstrip("\n"))
+        self.q.put(None)
+
+    def send(self, cmd):
+        self.proc.stdin.write("{\n" + cmd + "\n} < /dev/null\n")
+        self.proc.stdin.write(f"echo '{MARK}'$? \"$PWD\"\n")
+        self.proc.stdin.flush()
+
+
+# ------------------------------------------------------------------- app ----
+ACTIONS = ["init", "init-noprog", "program", "compile", "run",
+           "gdb", "stop", "open", "lab", "debug", "clear", "help", "quit",
+           "program-niosv", "program-project", "synth"]
+FKEYS = [("F1", "Init"), ("F2", "Prog"), ("F3", "Compile"), ("F4", "Run"),
+         ("F5", "Gdb"), ("F6", "Stop"), ("F7", "Open"), ("F8", "Clear"),
+         ("F9", "Debug"), ("^Q", "Quit")]
+# Tab and Ctrl-C are bound but left off the bar: they do the obvious thing
+# in any terminal program, and the space is better spent on the rest.
+# F10 quits too, but it is the mute key on a stock Mac keyboard, so the bar
+# advertises Ctrl-Q instead.
+
+
+def key_hints(width):
+    """The widest hint line that fits, dropping detail rather than truncating.
+
+    Every binding appears somewhere, so the bar is a complete command palette
+    on a wide terminal and degrades predictably on a narrow one.
+    """
+    for sep in ("  ", " "):
+        line = sep.join(f"{k} {n}" for k, n in FKEYS)
+        if len(line) <= width:
+            return line
+    line = " ".join(f"{k}{n[0]}" for k, n in FKEYS)      # F1I F2P ... ^QQ
+    return line if len(line) <= width else line[:max(0, width)]
+
+
+class Console:
+    def __init__(self):
+        self.vm   = Pane()
+        self.out  = Pane()
+        self.dbg  = Pane()
+        self.panes = [self.vm, self.out, self.dbg]
+        self.focus = 0
+        # The debug pane is the gdb SERVER's log: about 20 lines written once
+        # at startup, then silence. Not worth half the lower third, so it is
+        # hidden until asked for. Its health lives in the status row instead.
+        self.show_debug = False
+        # Hiding the pane must not hide a failure, so anything that looks
+        # like an error from the server brings it back into view.
+        self.dbg.on_add = self._debug_line
+
+        self.openbuf, self.opencur, self.openerr = "", 0, ""
+        self.prog_choices = []
+        # Wherever it was launched from, like any other shell command. No
+        # search, no configured root: the directory you are in is the one
+        # you meant, and F7 moves somewhere else.
+        self.startdir = os.getcwd()
+        self.cwd = self.startdir
+        self.shell = VMShell(self.vm)
+        self.busy = False
+        self.phase = ""
+        self.quit = False
+        self.buf = ""
+        self.cur = 0
+        self.history, self.hpos = [], 0
+        self.overlay = None
+        self.sel = 0
+        self.proc = None            # a Mac-side command, when one is running
+        self.handoff = None
+        self.polled = False
+        self.jtag_misses = 0
+        self.st = {"machine": None, "usb": None, "idcode": None,
+                   "term": None, "gdbsrv": None, "port": None, "at": 0}
+
+    def _debug_line(self, ln):
+        if re.search(r"error|failed|cannot|unable", ln, re.I):
+            self.show_debug = True
+
+    def project(self):
+        """The Quartus project in the working directory, if there is one.
+
+        Returns (name, built_sof_or_None). The Verilog labs build their own
+        bitstream; the assembly ones load the prebuilt Nios V computer, so
+        F2 has to know which kind of directory it is in.
+        """
+        d = self.cwd or self.startdir
+        qpf = sorted(glob.glob(os.path.join(d, "*.qpf")))
+        if not qpf:
+            return None, None
+        name = os.path.splitext(os.path.basename(qpf[0]))[0]
+        for cand in (os.path.join(d, "output_files", name + ".sof"),
+                     os.path.join(d, name + ".sof")):
+            if os.path.isfile(cand):
+                return name, cand
+        return name, None
+
+    def prompt_parts(self):
+        return f"{VM_USER}@{MACHINE}", ":", self.cwd, "$ "
+
+    def prompt(self):
+        a, b, c, d = self.prompt_parts()
+        return a + b + c + d
+
+    # ------------------------------------------------------------ running ---
+    def echo(self, text):
+        self.vm.add(self.prompt() + text)
+
+    def run_mac(self, argv, label, phase):
+        """cpen-init lives on the Mac: `orb usb` is a host command, so it
+        cannot go through the VM shell."""
+        if self.busy:
+            return
+        self.busy, self.phase = True, phase
+        self.vm.set_floor()
+        self.echo(label)
+        threading.Thread(target=self._mac, args=(argv,), daemon=True).start()
+
+    def _mac(self, argv):
+        try:
+            self.proc = subprocess.Popen(
+                argv, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, errors="replace")
+            for ln in self.proc.stdout:
+                c = clean(ln)
+                if not c or boring(c):
+                    continue
+                m = STEP.match(c)
+                if m:
+                    for needle, word in PHASES:
+                        if needle.lower() in m.group(1).lower():
+                            self.phase = word
+                            break
+                self.vm.add(c)
+            rc = self.proc.wait()
+            if rc:
+                self.vm.add(f"exit {rc}")
+        except FileNotFoundError:
+            self.vm.add(f"{argv[0]}: command not found")
+        except Exception as e:
+            self.vm.add(str(e))
+        finally:
+            self.proc = None
+            self.busy, self.phase = False, ""
+            self.st["at"] = 0
+
+    def run_vm(self, cmd, phase):
+        if self.busy:
+            self.vm.add(f"busy: {self.phase.lower()} — Ctrl-C to stop it")
+            return
+        if not self.shell.alive() and not self.shell.start(self.startdir):
+            self.echo(cmd)
+            self.vm.add("could not open a shell on the VM — is the machine running?")
+            return
+        self.busy, self.phase = True, phase
+        self.vm.set_floor()
+        self.echo(cmd)
+        try:
+            self.shell.send(cmd)
+        except Exception as e:
+            self.vm.add(str(e))
+            self.busy, self.phase = False, ""
+
+    def pump_shell(self):
+        """Drain whatever the VM shell has said since the last frame."""
+        drained = False
+        while True:
+            try:
+                ln = self.shell.q.get_nowait()
+            except queue.Empty:
+                return drained
+            drained = True
+            if ln is None:
+                if self.busy and not self.proc:
+                    self.busy, self.phase = False, ""
+                    self.vm.add("shell closed")
+                continue
+            if MARK in ln:
+                head, _, rest = ln.partition(MARK)
+                head = clean(head)
+                if head and not boring(head):
+                    self.vm.add(head)
+                rc, _, pwd = rest.partition(" ")
+                if pwd.strip():
+                    self.cwd = pwd.strip()
+                if rc.strip() not in ("0", ""):
+                    self.vm.add(f"exit {rc.strip()}")
+                self.busy, self.phase = False, ""
+                self.st["at"] = 0
+                continue
+            c = clean(ln)
+            if c and not boring(c):
+                self.vm.add(c)
+
+    def program_niosv(self):
+        self.run_mac([INIT_SH, "--program"], "cpen-init --program", "PROGRAMMING")
+
+    def make(self, target, phase):
+        self.run_vm(f"labmake {target}", phase)
+
+    def action(self, name):
+        if name == "init":
+            self.run_mac([INIT_SH], "cpen-init", "INITIALIZING")
+        elif name == "init-noprog":
+            self.run_mac([INIT_SH, "--no-program"],
+                         "cpen-init --no-program", "INITIALIZING")
+        elif name in ("program", "prog"):
+            # With a Quartus project here there is a real choice to make, so
+            # ask. With none, there is only one thing F2 can mean.
+            proj, sof = self.project()
+            if proj:
+                self.prog_choices = [("niosv", f"Nios V computer ({BOARD or 'board'})",
+                                      ["The prebuilt system the assembly labs run on"])]
+                if sof:
+                    self.prog_choices.append(
+                        ("project", f"{proj}.sof (already built)",
+                         ["Load the bitstream built in this directory"]))
+                self.prog_choices.append(
+                    ("build", f"Build {proj}, then program",
+                     ["Runs quartus_sh --flow compile. A small",
+                      "design takes about half a minute."]))
+                self.sel = 1 if sof else 0
+                self.overlay = "prog"
+            else:
+                self.program_niosv()
+        elif name == "program-niosv":
+            self.program_niosv()
+        elif name == "program-project":
+            self.make("PROGRAM_PROJECT", "PROGRAMMING")
+        elif name == "synth":
+            self.make("SYNTH", "SYNTHESIZING")
+        elif name == "synth-and-program":
+            # One command, so programming only happens if the build worked.
+            self.run_vm(f"labmake SYNTH && labmake PROGRAM_PROJECT", "SYNTHESIZING")
+        elif name == "stop":
+            self.run_mac([INIT_SH, "--stop"], "cpen-init --stop", "STOPPING")
+        elif name == "compile":
+            self.make("COMPILE", "COMPILING")
+        elif name == "run":
+            self.out.set_floor()
+            self.make("RUN", "LOADING")
+        elif name == "gdb":
+            # gdb takes over the whole terminal, so do not go there unless the
+            # debug server is actually listening — otherwise it clears the
+            # screen only to sit at "Connection timed out".
+            if not self.st["port"]:
+                self.echo("gdb")
+                self.vm.add(f"nothing is listening on port {GDB_PORT}.")
+                self.vm.add("run init (F1) first, then try again.")
+            else:
+                self.handoff = "GDB_CLIENT"
+        elif name == "debug":
+            self.show_debug = not self.show_debug
+            if not self.show_debug and self.focus == 2:
+                self.focus = 1
+        elif name == "clear":
+            self.panes[self.focus].clear()
+        elif name == "quit":
+            self.quit = True
+        elif name in ("open", "lab"):
+            # Start from the current directory: most of the time the next
+            # lab is a sibling, so it is a short edit rather than a retype.
+            self.openbuf = self.cwd if self.cwd.endswith("/") else self.cwd + "/"
+            self.opencur = len(self.openbuf)
+            self.openerr = ""
+            self.overlay = "open"
+        elif name == "help":
+            self.echo("help")
+            self.vm.add("Commands: " + "  ".join(ACTIONS))
+            self.vm.add("Anything else runs in the VM shell.")
+            self.vm.add("Tab: focus   arrows/PgUp/PgDn: scroll  "
+                        "Ctrl-P/Ctrl-N: history  Ctrl-C: stop")
+        else:
+            return False
+        return True
+
+    def submit(self):
+        cmd = self.buf.strip()
+        self.buf, self.cur = "", 0
+        if not cmd:
+            self.vm.add(self.prompt())
+            return
+        self.history.append(cmd)
+        self.hpos = len(self.history)
+        if not self.action(cmd):
+            self.run_vm(cmd, "RUNNING")
+
+    def interrupt(self):
+        if self.proc:
+            self.proc.terminate()
+            self.vm.add("^C")
+        elif self.busy:
+            # There is no tty between here and the VM, so a signal cannot be
+            # delivered. Replacing the shell is the honest way to stop it.
+            self.vm.add("^C  (restarting the VM shell)")
+            self.shell.start(self.cwd)
+            self.busy, self.phase = False, ""
+        else:
+            self.buf, self.cur = "", 0
+
+    # ------------------------------------------------------------- status ---
+    def poll(self):
+        while not self.quit:
+            if self.busy or time.time() - self.st["at"] < POLL_SECS:
+                time.sleep(0.3)
+                continue
+            self.st["at"] = time.time()
+            try:
+                r = subprocess.run(["orb", "list"], capture_output=True,
+                                   stdin=subprocess.DEVNULL,
+                                   text=True, timeout=10)
+                self.st["machine"] = bool(re.search(
+                    rf"^{MACHINE}\s+running", r.stdout, re.M))
+            except Exception:
+                self.st["machine"] = False
+            if not self.st["machine"]:
+                for k in ("usb", "idcode", "term", "gdbsrv", "port"):
+                    self.st[k] = None
+                self.polled = True
+                continue
+            # With no board configured yet, match any 8-digit IDCODE
+            # rather than the empty string, which would match every line.
+            want = EXPECT_IDCODE or "[0-9A-Fa-f]{8}"
+            probe = (
+                'lsusb | grep -qi altera && echo USB=1 || echo USB=0; '
+                f"'{QUARTUS_BIN}/jtagconfig' 2>&1 | "
+                f'grep -oE "{want}" | head -1 | sed "s/^/IDCODE=/"; '
+                'pgrep -f "[n]ios2-terminal" >/dev/null && echo TERM=1 || echo TERM=0; '
+                'pgrep -f "[a]sh-riscv-gdb-server|[o]penocd" >/dev/null '
+                '&& echo GDB=1 || echo GDB=0; '
+                f'ss -ltn | grep -q ":{GDB_PORT}" && echo PORT=1 || echo PORT=0')
+            try:
+                r = subprocess.run(
+                    ["orb", "-m", MACHINE, "bash", "-lc", probe],
+                    capture_output=True, stdin=subprocess.DEVNULL,
+                    text=True, timeout=30)
+                kv = dict(l.split("=", 1) for l in r.stdout.split() if "=" in l)
+                self.st["usb"]    = kv.get("USB") == "1"
+                self.st["idcode"] = kv.get("IDCODE")
+                self.st["term"]   = kv.get("TERM") == "1"
+                self.st["gdbsrv"] = kv.get("GDB") == "1"
+                self.st["port"]   = kv.get("PORT") == "1"
+            except Exception:
+                pass
+            self.polled = True
+            self.heal()
+
+    def heal(self):
+        st = self.st
+        broken = (st["machine"] and st["usb"] and st["idcode"] != EXPECT_IDCODE)
+        if not broken:
+            self.jtag_misses = 0
+            return
+        self.jtag_misses += 1
+        if self.jtag_misses < 2 or st["term"] or st["gdbsrv"]:
+            return
+        self.jtag_misses = 0
+        self.vm.add("jtag chain unreadable — restarting jtagd")
+        try:
+            subprocess.run(["orb", "-m", MACHINE, "bash", "-lc",
+                            "pkill -f 'linux64/[j]tagd'"],
+                           capture_output=True, stdin=subprocess.DEVNULL,
+                           timeout=20)
+        except Exception:
+            pass
+        self.st["at"] = 0
+
+    def start_heading(self):
+        """What the menu says about the board, before anything is done to it.
+
+        Stated plainly either way: the menu now opens every run, so "not
+        ready" would be wrong most of the time.
+        """
+        if not self.st["machine"]:
+            return f"VM '{MACHINE}' is not running."
+        if not self.st["usb"]:
+            return "No USB-Blaster. Is the board plugged in and powered on?"
+        if not self.st["idcode"]:
+            return "Cable attached, but no FPGA on the JTAG chain."
+        name = BOARD or "FPGA"
+        if self.ready() and self.st["term"] and self.st["gdbsrv"]:
+            return f"{name} ready, servers running."
+        return f"{name} detected ({self.st['idcode']}). Not initialized yet."
+
+    def ready(self):
+        return bool(self.st["machine"] and self.st["usb"]
+                    and self.st["idcode"] == EXPECT_IDCODE)
+
+    def status_word(self):
+        if self.busy:
+            return self.phase or "BUSY"
+        if not self.polled:
+            return "CHECKING"
+        return "READY" if self.ready() else "NOT READY"
+
+
+# --------------------------------------------------------------- painting ---
+P_OK, P_BAD, P_WARN, P_CHIP_OK, P_CHIP_BAD, P_CHIP_BUSY, P_USER, P_PATH = range(1, 9)
+
+
+def init_colors():
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+        bg = -1
+    except curses.error:
+        bg = curses.COLOR_BLACK
+    curses.init_pair(P_OK,   curses.COLOR_GREEN,  bg)
+    curses.init_pair(P_BAD,  curses.COLOR_RED,    bg)
+    curses.init_pair(P_WARN, curses.COLOR_YELLOW, bg)
+    # Both sides set, so the chip never depends on the terminal's own theme.
+    curses.init_pair(P_CHIP_OK,   curses.COLOR_BLACK, curses.COLOR_GREEN)
+    curses.init_pair(P_CHIP_BAD,  curses.COLOR_WHITE, curses.COLOR_RED)
+    curses.init_pair(P_CHIP_BUSY, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+    # Ubuntu's own prompt colours.
+    curses.init_pair(P_USER, curses.COLOR_GREEN, bg)
+    curses.init_pair(P_PATH, curses.COLOR_BLUE,  bg)
+
+
+def put(scr, y, x, text, attr=0):
+    h, w = scr.getmaxyx()
+    if y < 0 or y >= h or x < 0 or x >= w or not text:
+        return
+    room = w - x - (1 if y == h - 1 else 0)
+    if room <= 0:
+        return
+    try:
+        scr.addstr(y, x, text[:room], attr)
+    except curses.error:
+        pass          # writing the very last cell always reports an error
+
+
+NOSTATUS = object()      # distinct from None, which means "not known yet"
+
+
+def dot_glyph(v):
+    return "●" if v else ("✗" if v is not None else "?")
+
+
+def dot_pair(v):
+    return P_OK if v else (P_BAD if v is not None else P_WARN)
+
+
+def frame(scr, y, x, h, w, title, focused, status=NOSTATUS):
+    if h < 2 or w < 4:
+        return
+    a = curses.A_BOLD if focused else 0
+    put(scr, y, x, "┌" + "─" * (w - 2) + "┐", a)
+    put(scr, y + h - 1, x, "└" + "─" * (w - 2) + "┘", a)
+    for i in range(1, h - 1):
+        put(scr, y + i, x, "│", a)
+        put(scr, y + i, x + w - 1, "│", a)
+    if title:
+        rev = curses.A_REVERSE if focused else 0
+        t = f" {title} " if status is NOSTATUS else f" {title} {dot_glyph(status)} "
+        t = t[:max(0, w - 4)]
+        put(scr, y, x + 2, t, curses.A_BOLD | rev)
+        if status is not NOSTATUS and len(t) >= 3:
+            # Repaint the glyph in its own colour; the title attribute above
+            # would otherwise render it in the plain foreground.
+            put(scr, y, x + 2 + len(t) - 2, dot_glyph(status),
+                curses.color_pair(dot_pair(status)) | curses.A_BOLD | rev)
+
+
+def tail_rows(lines, width, want):
+    rows = []
+    for ln in reversed(lines):
+        for piece in reversed(wrap(ln, width)):
+            rows.append(piece)
+        if len(rows) >= want:
+            break
+    rows.reverse()
+    return rows
+
+
+def viewport(lines, tail, width, height, scroll, floor_i):
+    """The rows to show, and where the tail landed.
+
+    Everything from the floor sits at the TOP with blank space below, so a
+    new run starts on a clean screen. Once it outgrows the pane it scrolls
+    like a terminal. Scrolling up walks back past the floor into the
+    previous run's output, which is kept.
+    """
+    rows_after = []
+    for ln in lines[floor_i:]:
+        rows_after.extend(wrap(ln, width))
+    rows_after.extend(tail)
+    pad = max(0, height - len(rows_after))
+    need_before = max(0, height + scroll - len(rows_after) - pad)
+    rows_before = tail_rows(lines[:floor_i], width, need_before) if need_before else []
+    virtual = rows_before + rows_after + [""] * pad
+    scroll = min(scroll, max(0, len(virtual) - height))
+    end = len(virtual) - scroll
+    start = max(0, end - height)
+    tail_at = len(rows_before) + len(rows_after) - len(tail)
+    return virtual[start:end], start, scroll, tail_at
+
+
+def render_log(scr, y0, x0, h, w, pane, offline=None):
+    """Read-only pane, same viewport rules as the shell pane.
+
+    `offline` is a pair of lines shown centred when the process that feeds
+    this pane is not running, so an empty pane never looks like a program
+    that simply has not printed yet.
+    """
+    lines, scroll = pane.snapshot()
+    view, _, capped, _ = viewport(lines, [], w, h, scroll, pane.floor_index())
+    if capped != scroll:
+        with pane.lock:
+            pane.scroll = capped
+    for i in range(h):
+        put(scr, y0 + i, x0, (view[i] if i < len(view) else "").ljust(w)[:w])
+    # Only when there is nothing on screen — old output from a previous run
+    # stays readable rather than being written over.
+    if offline and not any(ln.strip() for ln in view):
+        top = y0 + max(0, (h - len(offline)) // 2)
+        for i, msg in enumerate(offline):
+            if top + i >= y0 + h:
+                break
+            msg = msg[:max(0, w - 2)]
+            put(scr, top + i, x0 + max(0, (w - len(msg)) // 2), msg,
+                curses.color_pair(P_BAD) | (curses.A_BOLD if i == 0 else 0))
+
+
+def draw(scr, app):
+    scr.erase()
+    h, w = scr.getmaxyx()
+    if h < 16 or w < 60:
+        put(scr, 0, 0, "Terminal too small — need at least 60x16", curses.A_BOLD)
+        scr.refresh()
+        return
+
+    avail = h - 1
+    bot_h = max(6, avail // 3)
+    top_h = avail - bot_h
+    lw = w // 2 + 1
+    rw = w - lw + 1
+
+    # -- top: the VM shell --------------------------------------------------
+    frame(scr, 0, 0, top_h, w, "OrbStack", app.focus == 0)
+    ch, cw = top_h - 2, w - 2
+    lines, scroll = app.vm.snapshot()
+
+    # The prompt is simply the last row of the pane's content, so output
+    # starts at the top and the prompt follows it down, like a real terminal.
+    if app.busy:
+        tail = []
+        pu = pp = ""
+    else:
+        pu, _, pc, pd = app.prompt_parts()
+        pu = pu + ":"
+        budget = cw - len(pu) - len(pd) - len(app.buf) - 1
+        if budget < len(pc) and budget > 4:
+            pc = "…" + pc[-(budget - 1):]
+        pp = pc + pd
+        tail = wrap(pu + pp + app.buf, cw)
+
+    view, start, capped, tail_at = viewport(
+        lines, tail, cw, ch, scroll, app.vm.floor_index())
+    if capped != scroll:
+        with app.vm.lock:
+            app.vm.scroll = capped
+        scroll = capped
+    for i, text in enumerate(view):
+        put(scr, 1 + i, 1, text.ljust(cw)[:cw])
+
+    # Colour the prompt the way Ubuntu's own does, then paint a block cursor.
+    if not app.busy and tail and 0 <= tail_at - start < ch:
+        first = 1 + tail_at - start              # screen row of the prompt's start
+        if len(tail) == 1:                       # only colour an unwrapped prompt
+            put(scr, first, 1, pu, curses.color_pair(P_USER) | curses.A_BOLD)
+            put(scr, first, 1 + len(pu), pp, curses.color_pair(P_PATH) | curses.A_BOLD)
+        # Index of the cursor within the whole prompt line, then map it
+        # through the same wrapping the text went through.
+        idx = len(pu) + len(pp) + app.cur
+        py2, px = first + idx // cw, 1 + idx % cw
+        if int(time.time() * 2) % 2 == 0 and px < w - 1 and py2 < 1 + ch:
+            under = app.buf[app.cur] if app.cur < len(app.buf) else " "
+            put(scr, py2, px, under, curses.A_REVERSE)
+
+    # -- bottom: two read-only logs -----------------------------------------
+    # An empty pane is ambiguous: dead process, or a program that has not
+    # printed? Say which, and say how to fix it.
+    term_off = None if app.st["term"] is not False else [
+        "not connected to nios2-terminal",
+        "nothing will appear here — press F1 to start it"]
+    gdb_off = None if app.st["gdbsrv"] is not False else [
+        "gdb server not running",
+        "nothing will appear here — press F1 to start it"]
+    by = top_h
+    if app.show_debug:
+        frame(scr, by, 0, bot_h, lw, "FPGA StdOut (Read Only)", app.focus == 1,
+              app.st["term"])
+        frame(scr, by, lw - 1, bot_h, rw, "GDB Server (Read Only)",
+              app.focus == 2, app.st["gdbsrv"])
+        put(scr, by, lw - 1, "┬")
+        put(scr, by + bot_h - 1, lw - 1, "┴")
+        render_log(scr, by + 1, 1, bot_h - 2, lw - 2, app.out, term_off)
+        render_log(scr, by + 1, lw, bot_h - 2, rw - 2, app.dbg, gdb_off)
+    else:
+        frame(scr, by, 0, bot_h, w, "FPGA StdOut (Read Only)", app.focus == 1,
+              app.st["term"])
+        render_log(scr, by + 1, 1, bot_h - 2, w - 2, app.out, term_off)
+
+    # -- palette row --------------------------------------------------------
+    py = h - 1
+    word = app.status_word()
+    spin = SPINNER[int(time.time() * 10) % len(SPINNER)] + " " if app.busy else ""
+    chip = f" {spin}{word} "
+    pair = (P_CHIP_BUSY if app.busy or word == "CHECKING"
+            else P_CHIP_OK if word == "READY" else P_CHIP_BAD)
+    st = app.st
+    health = [("vm", st["machine"]), ("usb", st["usb"]),
+              ("jtag", None if st["machine"] is None
+                       else st["idcode"] == EXPECT_IDCODE),
+              ("term", st["term"]), ("gdb", st["gdbsrv"])]
+    dots_w = sum(len(l) + 2 for l, _ in health)
+    right = len(chip) + dots_w + 2
+    hints = key_hints(max(0, w - right - 2))
+    put(scr, py, 1, hints, curses.A_DIM)
+    put(scr, py, w - len(chip) - 1, chip, curses.color_pair(pair) | curses.A_BOLD)
+    dx = w - len(chip) - dots_w - 2
+    for lbl, val in health:
+        put(scr, py, dx, lbl)
+        put(scr, py, dx + len(lbl), dot_glyph(val),
+            curses.color_pair(dot_pair(val)) | curses.A_BOLD)
+        dx += len(lbl) + 2
+
+    if app.overlay:
+        draw_overlay(scr, app)
+    scr.refresh()
+
+
+def box(scr, y, x, h, w, title):
+    put(scr, y, x, "┌" + "─" * (w - 2) + "┐", curses.A_BOLD)
+    for i in range(1, h - 1):
+        put(scr, y + i, x, "│" + " " * (w - 2) + "│", curses.A_BOLD)
+    put(scr, y + h - 1, x, "└" + "─" * (w - 2) + "┘", curses.A_BOLD)
+    put(scr, y, x + 2, f" {title} ", curses.A_BOLD | curses.A_REVERSE)
+
+
+START_ITEMS = [
+    ("Initialize", "init",
+     ["Attach USB, program the FPGA, start the", "debug server and the terminal"]),
+    ("Initialize (No Reprogram)", "init-noprog",
+     ["The same, but skip programming the FPGA", "(use when the board kept its power)"]),
+    ("Skip", None, ["Just open the console"]),
+    ("Quit", "quit", []),
+]
+
+
+def input_box(scr, title, prompt, text, cur, err, footer):
+    """A one-line text prompt, wide enough for a real path.
+
+    The cursor is painted rather than moved, matching the shell pane: the
+    terminal's own cursor stays hidden for the whole session.
+    """
+    h, w = scr.getmaxyx()
+    bw = min(w - 8, max(60, len(text) + 14))
+    bh = 7 if err else 6
+    y0, x0 = (h - bh) // 2, (w - bw) // 2
+    box(scr, y0, x0, bh, bw, title)
+    put(scr, y0 + 1, x0 + 3, prompt[:bw - 6], curses.A_BOLD)
+
+    field = bw - 8
+    # Scroll the text so the cursor stays visible on a long path.
+    off = max(0, cur - field + 1)
+    shown = text[off:off + field]
+    put(scr, y0 + 2, x0 + 3, "> " + shown.ljust(field))
+    cx = x0 + 5 + (cur - off)
+    under = text[cur] if cur < len(text) else " "
+    put(scr, y0 + 2, cx, under, curses.A_REVERSE)
+
+    row = y0 + 3
+    if err:
+        put(scr, row, x0 + 3, err[:bw - 6], curses.color_pair(P_BAD) | curses.A_BOLD)
+        row += 1
+    put(scr, y0 + bh - 2, x0 + 3, footer[:bw - 6], curses.A_DIM)
+
+
+def menu_box(scr, title, heading, items, sel, footer):
+    """items: list of (label, [description lines])"""
+    h, w = scr.getmaxyx()
+    body = []
+    for i, (label, desc) in enumerate(items):
+        body.append(("item", i, label))
+        for d in desc:
+            body.append(("desc", i, d))
+    widest = max([len(t) for _, _, t in body] + [len(heading), len(footer)])
+    bw = min(w - 6, widest + 14)
+    bh = min(h - 2, len(body) + (5 if heading else 3) + 2)
+    y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+    box(scr, y0, x0, bh, bw, title)
+    y = y0 + 1
+    if heading:
+        y += 1
+        put(scr, y, x0 + 4, heading, curses.A_BOLD)
+        y += 2
+    for kind, idx, text in body:
+        if y >= y0 + bh - 2:
+            break
+        if kind == "item":
+            chosen = idx == sel
+            label = f" {'▸' if chosen else ' '} {text} ".ljust(bw - 10)
+            put(scr, y, x0 + 4, label,
+                curses.A_REVERSE | curses.A_BOLD if chosen else curses.A_BOLD)
+        else:
+            put(scr, y, x0 + 9, text, curses.A_DIM)
+        y += 1
+    put(scr, y0 + bh - 2, x0 + 4, footer, curses.A_DIM)
+
+
+def draw_overlay(scr, app):
+    if app.overlay == "start":
+        menu_box(scr, "Start", app.start_heading(),
+                 [(lbl, desc) for lbl, _, desc in START_ITEMS], app.sel,
+                 "↑ ↓ or Tab to move · Enter to select")
+    elif app.overlay == "prog":
+        menu_box(scr, "Program FPGA", "What should be loaded onto the board?",
+                 [(lbl, desc) for _, lbl, desc in app.prog_choices], app.sel,
+                 "↑ ↓ or Tab to move · Enter to select · Esc to cancel")
+    elif app.overlay == "open":
+        input_box(scr, "Open Directory", "Directory to work in:",
+                  app.openbuf, app.opencur, app.openerr,
+                  "Tab to complete · Enter to open · Esc to cancel")
+
+# ------------------------------------------------------------------ input ---
+FKEY_ACTION = {curses.KEY_F1: "init", curses.KEY_F2: "program",
+               curses.KEY_F3: "compile", curses.KEY_F4: "run",
+               curses.KEY_F5: "gdb", curses.KEY_F6: "stop",
+               curses.KEY_F7: "open", curses.KEY_F8: "clear",
+               curses.KEY_F9: "debug", curses.KEY_F10: "quit"}
+
+
+def complete_dir(text):
+    """Extend a partial path to the longest unambiguous directory match.
+
+    Only paths the Mac can see are completed. The VM's own filesystem is
+    not reachable from here, so those are left to the shell to resolve.
+    """
+    path = os.path.expanduser(os.path.expandvars(text))
+    base = os.path.dirname(path) or "/"
+    frag = os.path.basename(path)
+    if not os.path.isdir(base):
+        return text, []
+    try:
+        names = sorted(n for n in os.listdir(base)
+                       if n.startswith(frag) and os.path.isdir(os.path.join(base, n)))
+    except OSError:
+        return text, []
+    if not names:
+        return text, []
+    common = os.path.commonprefix(names)
+    done = os.path.join(base, common)
+    if len(names) == 1:
+        done = done.rstrip("/") + "/"
+    return done, names
+
+
+def handle_open(app, ch):
+    """The Open Directory prompt.
+
+    Pasting works because the main loop drains every key already waiting
+    before it redraws, so a pasted path arrives as an ordinary burst of
+    characters rather than one character per frame.
+    """
+    if ch in (ord("\n"), curses.KEY_ENTER, 10, 13):
+        raw = app.openbuf.strip()
+        if not raw:
+            app.overlay = None
+            return
+        path = os.path.expanduser(os.path.expandvars(raw))
+        # A path under a Mac-visible root can be checked here and the
+        # mistake reported immediately. Anything else is the VM's to judge.
+        mac_visible = path.startswith(("/Users/", "/Volumes/", "/tmp/"))
+        if mac_visible and not os.path.isdir(path):
+            app.openerr = "no such directory"
+            return
+        app.openerr = ""
+        app.overlay = None
+        app.startdir = path
+        app.run_vm(f"cd {sh(path)}", "RUNNING")
+    elif ch == 27:
+        app.overlay = None
+    elif ch == ord("\t"):
+        done, names = complete_dir(app.openbuf)
+        if done != app.openbuf:
+            app.openbuf, app.opencur, app.openerr = done, len(done), ""
+        elif len(names) > 1:
+            app.openerr = "  ".join(names[:6]) + ("  ..." if len(names) > 6 else "")
+    elif ch in (curses.KEY_BACKSPACE, 127, 8):
+        if app.opencur:
+            app.openbuf = app.openbuf[:app.opencur - 1] + app.openbuf[app.opencur:]
+            app.opencur -= 1
+            app.openerr = ""
+    elif ch == curses.KEY_DC:
+        app.openbuf = app.openbuf[:app.opencur] + app.openbuf[app.opencur + 1:]
+    elif ch == curses.KEY_LEFT:
+        app.opencur = max(0, app.opencur - 1)
+    elif ch == curses.KEY_RIGHT:
+        app.opencur = min(len(app.openbuf), app.opencur + 1)
+    elif ch in (curses.KEY_HOME, 1):                      # Ctrl-A
+        app.opencur = 0
+    elif ch in (curses.KEY_END, 5):                       # Ctrl-E
+        app.opencur = len(app.openbuf)
+    elif ch == 21:                                        # Ctrl-U
+        app.openbuf, app.opencur, app.openerr = "", 0, ""
+    elif ch == 23:                                        # Ctrl-W, back a path part
+        left = app.openbuf[:app.opencur].rstrip("/")
+        cut = left.rfind("/") + 1
+        app.openbuf = app.openbuf[:cut] + app.openbuf[app.opencur:]
+        app.opencur = cut
+    elif 32 <= ch < 0x110000:
+        try:
+            c = chr(ch)
+        except ValueError:
+            return
+        app.openbuf = app.openbuf[:app.opencur] + c + app.openbuf[app.opencur:]
+        app.opencur += 1
+        app.openerr = ""
+
+
+def handle(app, ch):
+    # The text prompt owns every key while it is up, so it comes first.
+    if app.overlay == "open":
+        handle_open(app, ch)
+        return
+
+    if app.overlay:
+        items = (START_ITEMS if app.overlay == "start"
+                 else app.prog_choices)
+        n = len(items)
+        if not n:
+            app.overlay = None
+            return
+        if ch == curses.KEY_UP:
+            app.sel = (app.sel - 1) % n
+        elif ch in (curses.KEY_DOWN, ord("\t")):
+            app.sel = (app.sel + 1) % n
+        elif ch in (ord("\n"), curses.KEY_ENTER, 10, 13):
+            if app.overlay == "start":
+                _, act, _ = START_ITEMS[app.sel]
+                app.overlay = None
+                if act:
+                    app.action(act)
+            elif app.overlay == "prog":
+                kind = app.prog_choices[app.sel][0]
+                app.overlay = None
+                app.action({"niosv": "program-niosv",
+                            "project": "program-project",
+                            "build": "synth-and-program"}[kind])
+        elif ch == 27 and app.overlay != "start":
+            app.overlay = None
+        return
+
+
+    pane = app.panes[app.focus]
+    if ch in FKEY_ACTION:
+        app.action(FKEY_ACTION[ch])
+    elif ch == 3:                                        # Ctrl-C
+        app.interrupt()
+    elif ch == 17:                                       # Ctrl-Q
+        app.action("quit")
+    elif ch == 12:                                       # Ctrl-L
+        pane.clear()
+    elif ch == ord("\t"):
+        vis = [0, 1, 2] if app.show_debug else [0, 1]
+        i = vis.index(app.focus) if app.focus in vis else 0
+        app.focus = vis[(i + 1) % len(vis)]
+    elif ch in (ord("\n"), curses.KEY_ENTER, 10, 13):
+        app.submit()
+    elif ch in (curses.KEY_BACKSPACE, 127, 8):
+        if app.cur:
+            app.buf = app.buf[:app.cur - 1] + app.buf[app.cur:]
+            app.cur -= 1
+    elif ch == curses.KEY_DC:
+        app.buf = app.buf[:app.cur] + app.buf[app.cur + 1:]
+    # Arrows scroll the focused pane, always — never the draft command.
+    elif ch == curses.KEY_UP:
+        pane.scroll += 1
+    elif ch == curses.KEY_DOWN:
+        pane.scroll = max(0, pane.scroll - 1)
+    elif ch == curses.KEY_PPAGE:
+        pane.scroll += 10
+    elif ch == curses.KEY_NPAGE:
+        pane.scroll = max(0, pane.scroll - 10)
+    elif ch == curses.KEY_MOUSE:
+        try:
+            _, _, _, _, bstate = curses.getmouse()
+        except curses.error:
+            return
+        if bstate & curses.BUTTON4_PRESSED:
+            pane.scroll += 3
+        elif bstate & WHEEL_DOWN:
+            pane.scroll = max(0, pane.scroll - 3)
+    elif ch == curses.KEY_END:
+        pane.scroll = 0
+    elif ch == curses.KEY_LEFT:
+        app.cur = max(0, app.cur - 1)
+    elif ch == curses.KEY_RIGHT:
+        app.cur = min(len(app.buf), app.cur + 1)
+    elif ch == 1:                                        # Ctrl-A
+        app.cur = 0
+    elif ch == 5:                                        # Ctrl-E
+        app.cur = len(app.buf)
+    elif ch == 16:                                       # Ctrl-P, history back
+        if app.history:
+            app.hpos = max(0, app.hpos - 1)
+            app.buf = app.history[app.hpos]
+            app.cur = len(app.buf)
+    elif ch == 14:                                       # Ctrl-N, history forward
+        if app.history:
+            app.hpos = min(len(app.history), app.hpos + 1)
+            app.buf = "" if app.hpos >= len(app.history) else app.history[app.hpos]
+            app.cur = len(app.buf)
+    elif 32 <= ch < 127:
+        app.buf = app.buf[:app.cur] + chr(ch) + app.buf[app.cur:]
+        app.cur += 1
+
+
+SKIP = -2          # a key to ignore, distinct from -1 "nothing waiting"
+
+ESC_MAP = {
+    "[A": curses.KEY_UP,    "[B": curses.KEY_DOWN,
+    "[C": curses.KEY_RIGHT, "[D": curses.KEY_LEFT,
+    "OA": curses.KEY_UP,    "OB": curses.KEY_DOWN,
+    "OC": curses.KEY_RIGHT, "OD": curses.KEY_LEFT,
+    "[H": curses.KEY_HOME,  "[F": curses.KEY_END,
+    "[5~": curses.KEY_PPAGE, "[6~": curses.KEY_NPAGE, "[3~": curses.KEY_DC,
+    "OP": curses.KEY_F1, "OQ": curses.KEY_F2, "OR": curses.KEY_F3, "OS": curses.KEY_F4,
+    "[11~": curses.KEY_F1, "[12~": curses.KEY_F2, "[13~": curses.KEY_F3,
+    "[14~": curses.KEY_F4, "[15~": curses.KEY_F5, "[17~": curses.KEY_F6,
+    "[18~": curses.KEY_F7, "[19~": curses.KEY_F8, "[20~": curses.KEY_F9,
+    "[21~": curses.KEY_F10,
+}
+
+
+def read_key(scr):
+    """getch, but finish any escape sequence ncurses hands back unresolved.
+
+    With a window timeout set, ncurses can return a bare ESC when the timeout
+    fires partway through an arrow key, and the rest ("[B") then lands in the
+    input as literal text. Draining the remainder here makes arrows and
+    function keys work regardless of that timing.
+    """
+    ch = scr.getch()
+    if ch != 27:
+        return ch
+    scr.nodelay(True)
+    seq = ""
+    try:
+        for _ in range(8):
+            c = scr.getch()
+            if c == -1:
+                break
+            if 0 <= c < 256:
+                seq += chr(c)
+            if seq in ESC_MAP:
+                return ESC_MAP[seq]
+            if seq in ("[200~", "[201~"):
+                return SKIP        # bracketed-paste wrapper, not a keypress
+            if seq.endswith("~") or (len(seq) > 1 and seq[-1].isalpha()):
+                break
+    finally:
+        scr.nodelay(False)
+        scr.timeout(60)
+    return ESC_MAP.get(seq, 27)
+
+
+def spawn_window(app, target):
+    """Run an interactive tool in a NEW terminal window, leaving the TUI up.
+
+    gdb needs a real terminal of its own. Taking over this one means losing
+    sight of the console and the FPGA output while debugging, so hand the job
+    to a separate window instead.
+    """
+    os.makedirs(RUNDIR, exist_ok=True)
+    path = os.path.join(RUNDIR, "gdb-session.sh")
+    orb = shutil.which("orb") or "orb"
+    inner = f"cd {sh(app.cwd)} && make -f {sh(MAKEFILE)} {target}"
+    with open(path, "w") as f:
+        f.write(f"""#!/bin/bash
+echo "--- {target} · {MACHINE} ---"
+echo "quit gdb with 'quit'. The console is still running in the other window."
+echo
+{sh(orb)} -m {MACHINE} bash -lc {sh(inner)}
+echo
+echo "--- session ended, you can close this window ---"
+""")
+    os.chmod(path, 0o755)
+
+    term = os.environ.get("TERM_PROGRAM", "")
+    if "iTerm" in term:
+        osa = f'tell application "iTerm" to create window with default profile command "{path}"'
+    else:
+        osa = (f'tell application "Terminal" to do script "{path}"\n'
+               'tell application "Terminal" to activate')
+    try:
+        r = subprocess.run(["osascript", *sum((["-e", l] for l in osa.split("\n")), [])],
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode == 0:
+            app.vm.add(f"{target} opened in a new terminal window.")
+            return True
+        app.vm.add(f"could not open a window: {r.stderr.strip()[:120]}")
+    except Exception as e:
+        app.vm.add(f"could not open a window: {e}")
+    return False
+
+
+def handoff(app):
+    target, app.handoff = app.handoff, None
+    curses.endwin()
+    os.system("clear")
+    print(f"--- {target} — the console returns when this exits ---\n", flush=True)
+    script = f"cd {sh(app.cwd)} && make -f {sh(MAKEFILE)} {target}"
+    subprocess.call(["orb", "-m", MACHINE, "bash", "-lc", script])
+    input("\n--- press Enter to return to the console ---")
+
+
+def main(scr):
+    try:
+        curses.set_escdelay(25)
+    except (AttributeError, curses.error):
+        pass
+    init_colors()
+    curses.raw()                    # deliver Ctrl-C as a key, not as SIGINT
+    curses.curs_set(0)              # a block cursor is painted instead
+    scr.keypad(True)
+    scr.timeout(60)                 # ~16fps, enough for the spinner and blink
+    try:
+        # Wheel only. A wider mask would take over click-drag selection,
+        # which people still want for copying text out of the panes.
+        curses.mousemask(curses.BUTTON4_PRESSED | WHEEL_DOWN)
+    except curses.error:
+        pass
+
+    app = Console()
+    Tailer(TERM_LOG, app.out).start()
+    Tailer(GDB_LOG, app.dbg).start()
+    threading.Thread(target=app.poll, daemon=True).start()
+    app.shell.start(app.startdir)
+
+    t0 = time.time()
+    while time.time() - t0 < 20 and not app.polled:
+        app.pump_shell()
+        draw(scr, app)
+        time.sleep(0.06)
+    # Always offer the menu, not only when something is wrong: it is how you
+    # choose between initializing, skipping and quitting, and it is the only
+    # place the detected board is stated before any work happens.
+    app.overlay = "start"
+    app.sel = 0 if not app.ready() else 2
+
+    while not app.quit:
+        if app.handoff:
+            target, app.handoff = app.handoff, None
+            if not spawn_window(app, target):
+                # Only the in-place fallback tears curses down, so only that
+                # path has to build it back up.
+                app.handoff = target
+                handoff(app)
+                scr = curses.initscr()
+                init_colors()
+                curses.raw()
+                curses.curs_set(0)
+                scr.keypad(True)
+                scr.timeout(60)
+            app.st["at"] = 0
+        app.pump_shell()
+        draw(scr, app)
+        # Drain every key already waiting before redrawing. Typed input
+        # arrives one key per frame either way; a paste arrives as dozens
+        # at once, and one full repaint per character made it crawl.
+        first = True
+        for _ in range(512):
+            if not first:
+                scr.timeout(0)
+            ch = read_key(scr)
+            if not first:
+                scr.timeout(60)
+            first = False
+            if ch == -1:
+                break
+            if ch == SKIP:
+                continue
+            if ch == curses.KEY_RESIZE:
+                try:
+                    curses.update_lines_cols()
+                except Exception:
+                    pass
+                continue
+            handle(app, ch)
+            if app.quit or app.handoff:
+                break
+    app.shell.stop()
+
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass

@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+#
+# cpen-verilog - run the SystemVerilog build targets from a Mac terminal.
+#
+#   cpen-verilog SYNTH                    in the current folder
+#   cpen-verilog SIM ~/CPEN211/lab3       in that folder
+#   cpen-verilog NEWPROJECT TOP=fulladder passing a make variable
+#   cpen-verilog list                     show the targets
+#
+# These are the same targets cpen-nios runs from its shell pane. This is
+# for when you would rather stay in your own terminal.
+#
+set -uo pipefail
+
+TARGETS="NEWPROJECT SYNTH PROGRAM_PROJECT RTL SCHEMATIC SIM SIM_COMPILE SIM_WAVE WAVE CLEAN WHICH"
+
+usage() {
+  cat <<EOF
+usage: cpen-verilog <TARGET> [directory] [VAR=value ...]
+
+  NEWPROJECT       turn an empty folder into a Quartus project (run once)
+  SYNTH            compile your Verilog to a bitstream        (~30s)
+  PROGRAM_PROJECT  load that bitstream onto the board         (~3s)
+  SIM              compile and run your testbench
+  SIM_WAVE         run the testbench and write <tb>.vcd
+  WAVE             the same, then open it in Surfer on the Mac
+  RTL              draw a schematic, writing <top>_rtl.svg
+  SCHEMATIC        the same, then open it in Preview on the Mac
+  CLEAN            delete build output
+  WHICH            show which tools and board are in use
+
+Runs in the current directory unless you name another one.
+
+Anything shaped like VAR=value is passed to make, in any order:
+
+  TOP=<module>      the top-level module, required by NEWPROJECT
+  TB=<module>       the testbench module, when it is not found automatically
+  BOARD=<board>     override the detected board
+  OPEN=1            open what the target produced
+EOF
+}
+
+case "${1:-}" in
+  ""|-h|--help|help) usage; exit 0 ;;
+  list) echo "$TARGETS" | tr ' ' '\n'; exit 0 ;;
+esac
+
+TARGET=$1
+shift
+
+case " $TARGETS " in
+  *" $TARGET "*) ;;
+  *) echo "unknown target: $TARGET" >&2; echo >&2; usage >&2; exit 2 ;;
+esac
+
+# Anything shaped like VAR=value goes to make, the way make itself takes
+# them; the one remaining argument, if any, is the directory.
+DIR=""
+VARS=""
+for arg in "$@"; do
+  case "$arg" in
+    [A-Za-z_]*=*) VARS="$VARS $(printf '%q' "$arg")" ;;
+    *) if [ -n "$DIR" ]; then
+         echo "two directories given: $DIR and $arg" >&2; exit 2
+       fi
+       DIR=$arg ;;
+  esac
+done
+DIR=${DIR:-$PWD}
+
+CONFIG_FILE="${CPEN_TOOLS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/cpen-tools/config}"
+[ -r "$CONFIG_FILE" ] || { echo "no config at $CONFIG_FILE - run cpen-setup first" >&2; exit 1; }
+
+# Read only the assignments we need; never execute the file.
+val() { sed -n "s/^$1=['\"]\{0,1\}\([^'\"]*\)['\"]\{0,1\}$/\1/p" "$CONFIG_FILE" | tail -1; }
+MACHINE=$(val MACHINE); MACHINE=${MACHINE:-altera}
+MAKEFILE=$(val MAKEFILE)
+[ -n "$MAKEFILE" ] || { echo "no MAKEFILE in $CONFIG_FILE - re-run cpen-setup" >&2; exit 1; }
+
+[ -d "$DIR" ] || { echo "no such directory: $DIR" >&2; exit 1; }
+ABS=$(cd "$DIR" && pwd)
+
+case "$ABS" in
+  /Users/*) ;;
+  *) echo "warning: $ABS is not under /Users, so the VM may not see it" >&2 ;;
+esac
+
+if [ "$TARGET" != NEWPROJECT ] && [ -n "$(find "$ABS" -maxdepth 1 -name '*.qpf' -print -quit)" ]; then
+  :
+elif [ "$TARGET" != NEWPROJECT ] && [ "$TARGET" != CLEAN ] && [ "$TARGET" != WHICH ]; then
+  echo "note: no Quartus project in $ABS - run 'cpen-verilog NEWPROJECT' first" >&2
+fi
+
+exec orb -m "$MACHINE" bash -lc \
+  "cd '$ABS' && make -f '$MAKEFILE' $TARGET$VARS" < /dev/null

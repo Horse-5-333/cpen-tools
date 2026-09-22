@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+#
+# cpen-uninstall - undo what cpen-setup changed.
+#
+#   cpen-uninstall            config, state and the PATH line
+#   cpen-uninstall --all      the above, and delete the VM (~20GB)
+#   cpen-uninstall --dry-run  list what would go, change nothing
+#   cpen-uninstall --yes      do not ask (for scripts)
+#
+# It shows you everything it found and waits for confirmation before
+# deleting anything.
+#
+# It deliberately leaves alone: Homebrew, the Xcode Command Line Tools,
+# Rosetta, OrbStack and Surfer. Those are general-purpose and you may well
+# want them for something else. It never touches your lab files.
+#
+set -uo pipefail
+
+MACHINE=${CPEN_VM:-altera}
+# CPEN_TOOLS_CONFIG names one install's settings. When it is set, that one
+# file is all that is ours to remove: the folder around it holds the other
+# install's config and its Questa licence, and taking the folder would
+# uninstall something nobody asked about.
+CONFIG_FILE="${CPEN_TOOLS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/cpen-tools/config}"
+CONFIG_HOME=$(dirname "$CONFIG_FILE")
+SCOPED=0; [ -n "${CPEN_TOOLS_CONFIG:-}" ] && SCOPED=1
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}/cpen-tools"
+TAG='# added by cpen-setup'
+# Earlier releases used different wording; match those too or an upgraded
+# install leaves its PATH line behind.
+OLD_TAGS='# added by fpga-setup
+# added by fpga-nios setup.sh
+# added by fpga-console setup.sh'
+found_tag() {  # found_tag <file>, echoes the tag present
+  { printf '%s\n' "$TAG"; printf '%s\n' "$OLD_TAGS"; } | while IFS= read -r t; do
+    [ -n "$t" ] && grep -qF "$t" "$1" 2>/dev/null && { printf '%s' "$t"; return; }
+  done
+}
+LICENCE="$CONFIG_HOME/Questa_License.dat"
+
+strip_path_line() {  # strip_path_line <tag> <file>, cleaned profile on stdout
+  # `skip` used to be a counter that nothing decremented, so if the line
+  # after the tag was not the export - someone had deleted it by hand, or
+  # put a comment in between - it stayed armed and ate the next
+  # `export PATH=` anywhere further down the file, which could easily be
+  # one the reader wrote themselves. Only the line immediately after the
+  # tag is ours to remove.
+  #
+  # The blank line before the tag is held back rather than counted, since
+  # the previous version computed it and then never used it.
+  awk -v tag="$1" '
+    $0 == tag { pending = 0; hold = 1; next }
+    hold      { hold = 0; if ($0 ~ /^export PATH=/) next }
+    $0 == ""  { if (pending) print ""; pending = 1; next }
+              { if (pending) { print ""; pending = 0 } print }
+    END       { if (pending) print "" }
+  ' "$2"
+}
+
+# Sourcing with CPEN_UNINSTALL_LIB_ONLY=1 gives the helpers without
+# surveying or deleting anything, so tests can exercise them directly.
+[ -n "${CPEN_UNINSTALL_LIB_ONLY:-}" ] && return 0
+
+DRY=0 ALL=0 YES=0
+for a in "$@"; do
+  case "$a" in
+    --dry-run) DRY=1 ;;
+    --all)     ALL=1 ;;
+    --yes|-y)  YES=1 ;;
+    -h|--help) sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $a (try --help)" >&2; exit 2 ;;
+  esac
+done
+
+bold() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+item() { printf '  \033[31mremove\033[0m  %s\n' "$*"; }
+keep() { printf '  \033[32mkeep\033[0m    %s\n' "$*"; }
+note() { printf '  \033[33m!\033[0m       %s\n' "$*"; }
+
+profile_for_shell() {
+  case "$(basename "${SHELL:-}")" in
+    zsh)  echo "$HOME/.zshrc" ;;
+    bash) [ -f "$HOME/.bash_profile" ] && echo "$HOME/.bash_profile" || echo "$HOME/.profile" ;;
+    *)    echo "" ;;
+  esac
+}
+PROFILE=$(profile_for_shell)
+
+# ------------------------------------------------------------- survey ---
+found=0
+bold "On this Mac"
+
+if [ "$SCOPED" = 1 ]; then
+  if [ -f "$CONFIG_FILE" ]; then
+    item "$CONFIG_FILE  ($(du -sh "$CONFIG_FILE" 2>/dev/null | cut -f1))"
+    keep "the rest of $CONFIG_HOME, which belongs to your other install"
+  else keep "no config at $CONFIG_FILE"; fi
+elif [ -d "$CONFIG_HOME" ]; then
+  item "$CONFIG_HOME  ($(du -sh "$CONFIG_HOME" 2>/dev/null | cut -f1))"
+  for f in "$CONFIG_HOME"/*; do [ -e "$f" ] && printf '            %s\n' "$(basename "$f")"; done
+  found=1
+else keep "no config directory"; fi
+
+if [ -d "$STATE_HOME" ]; then
+  item "$STATE_HOME  ($(du -sh "$STATE_HOME" 2>/dev/null | cut -f1))"
+  found=1
+else keep "no state directory"; fi
+
+PROFILE_TAG=$([ -n "$PROFILE" ] && found_tag "$PROFILE")
+if [ -n "$PROFILE_TAG" ]; then
+  item "the PATH line in $PROFILE:"
+  grep -A1 -F "$PROFILE_TAG" "$PROFILE" | sed 's/^/            /'
+  found=1
+else keep "nothing to remove from your shell profile"; fi
+
+bold "In the VM"
+if orb list 2>/dev/null | awk '{print $1}' | grep -qx "$MACHINE"; then
+  size=$(orb list 2>/dev/null | awk -v m="$MACHINE" '$1==m {print $(NF-2), $(NF-1)}')
+  if [ "$ALL" = 1 ]; then
+    item "the whole '$MACHINE' machine, including /opt/altera  ($size)"
+    found=1
+  else
+    keep "'$MACHINE' left alone  ($size).  Pass --all to delete it."
+  fi
+else keep "no '$MACHINE' machine"; fi
+
+bold "Left alone either way"
+keep "Homebrew, Xcode Command Line Tools, Rosetta, OrbStack, Surfer"
+keep "your lab files, wherever you keep them"
+keep "this repository (delete the folder yourself when you are done)"
+
+if [ -f "$LICENCE" ]; then
+  bold "One thing worth saving first"
+  note "$LICENCE is your Questa licence."
+  note "It is free to replace but means another web form, and it is tied"
+  note "to the VM's NIC, so a new VM needs a new one regardless."
+  note "Copy it somewhere safe now if you might come back to this."
+fi
+
+if [ "$found" = 0 ]; then
+  bold "Nothing to do"
+  exit 0
+fi
+
+if [ "$DRY" = 1 ]; then
+  bold "Dry run, nothing was changed"
+  exit 0
+fi
+
+# ------------------------------------------------------------ confirm ---
+if [ "$YES" != 1 ]; then
+  if [ ! -t 0 ]; then
+    echo >&2
+    echo "Refusing to delete without a terminal to confirm at. Pass --yes." >&2
+    exit 1
+  fi
+  printf '\nType \033[1mremove\033[0m to go ahead: '
+  read -r reply
+  [ "$reply" = "remove" ] || { echo "Cancelled, nothing changed."; exit 1; }
+fi
+
+# ------------------------------------------------------------- remove ---
+bold "Removing"
+
+if [ "$SCOPED" = 1 ]; then
+  [ -f "$CONFIG_FILE" ] && { rm -f "$CONFIG_FILE" && echo "  removed $CONFIG_FILE"; }
+else
+  [ -d "$CONFIG_HOME" ] && { rm -rf "$CONFIG_HOME" && echo "  removed $CONFIG_HOME"; }
+fi
+[ -d "$STATE_HOME" ]  && { rm -rf "$STATE_HOME"  && echo "  removed $STATE_HOME"; }
+
+if [ -n "$PROFILE_TAG" ]; then
+  cp "$PROFILE" "$PROFILE.bak-cpen-uninstall"
+  strip_path_line "$PROFILE_TAG" "$PROFILE.bak-cpen-uninstall" > "$PROFILE"
+  echo "  cleaned $PROFILE  (previous version at $PROFILE.bak-cpen-uninstall)"
+fi
+
+if [ "$ALL" = 1 ] && orb list 2>/dev/null | awk '{print $1}' | grep -qx "$MACHINE"; then
+  orb delete -f "$MACHINE" >/dev/null 2>&1 \
+    && echo "  deleted the '$MACHINE' machine" \
+    || echo "  could not delete '$MACHINE'; try: orb delete $MACHINE" >&2
+fi
+
+bold "Done"
+echo "  Open a new terminal for the PATH change to take effect."
+[ "$ALL" = 1 ] || echo "  The '$MACHINE' VM is still there; 'orb delete $MACHINE' removes it."

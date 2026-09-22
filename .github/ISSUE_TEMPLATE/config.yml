@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Troubleshooting
+    url: https://github.com/Horse-5-333/cpen-tools/blob/main/docs/TROUBLESHOOTING.md
+    about: The common failures and what each one means. Worth a look first.
+  - name: The install guide
+    url: https://github.com/Horse-5-333/cpen-tools/blob/main/docs/SETUP.md
+    about: Every step written out, with a check after each one.
+  - name: Reference
+    url: https://github.com/Horse-5-333/cpen-tools/blob/main/docs/REFERENCE.md
+    about: Every command flag, config key, environment variable and exit code.

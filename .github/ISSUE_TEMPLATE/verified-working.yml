@@ -1,0 +1,73 @@
+name: Verified working
+description: It works on your machine, and you want that on the record
+title: "Verified working: "
+labels: ["✅ Verified Working"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you. A setup that differs from the one this was verified on
+        is the useful kind, so please send this even if nothing went wrong.
+
+        Please do not paste lab code, handout text or a solution. Nothing
+        here needs it.
+
+  - type: textarea
+    id: report
+    attributes:
+      label: cpen-setup --report
+      description: |
+        Run this on your Mac and paste the whole thing. It already comes
+        wrapped in a code block, so paste it as it is.
+
+        ```
+        cpen-setup --report
+        ```
+
+        It changes nothing, it never reads your licence file or your VNC
+        password, and it replaces your home directory and username before
+        printing.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: worked
+    attributes:
+      label: What you actually used
+      description: |
+        The report says these are installed. This says they ran. Tick only
+        what you used yourself.
+      options:
+        - label: Programmed the board (`cpen-nios` F1 and F2, or `cpen-verilog PROGRAM_PROJECT`)
+        - label: Ran a Nios V assembly lab (compile, run, program output)
+        - label: Debugged with GDB (F5)
+        - label: Built a SystemVerilog project (`cpen-verilog SYNTH`)
+        - label: Simulated (`cpen-verilog SIM` or `WAVE`)
+        - label: Opened a waveform in Surfer or GTKWave
+        - label: Drew a schematic (`cpen-verilog SCHEMATIC`)
+        - label: Ran the Quartus GUI (`cpen-gui`)
+        - label: Ran the Questa GUI (`cpen-gui questa`)
+
+  - type: dropdown
+    id: route
+    attributes:
+      label: How you installed it
+      options:
+        - cpen-setup
+        - docs/SETUP.md, by hand
+        - A mixture of both
+    validations:
+      required: true
+
+  - type: textarea
+    id: friction
+    attributes:
+      label: Anything that needed working out
+      description: |
+        Optional, and the most useful box on this form. A step whose
+        wording was wrong, something that failed once and worked on a
+        second run, a version different from the one in the guide, a board
+        other than a DE10-Lite. Small corrections are welcome as pull
+        requests too.
+    validations:
+      required: false

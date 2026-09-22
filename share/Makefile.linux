@@ -1,0 +1,20 @@
+# Makefile for the CPEN 211 labs on Linux.
+#
+# Split by what it is for, because the two kinds of lab have little in
+# common beyond the board:
+#
+#   common.mk    board, tools, programming the FPGA, the JTAG chain
+#   niosv.mk     assemble, download and debug a Nios V program
+#   verilog.mk   build, simulate and program your own hardware
+#
+# Including all three keeps a single entry point, so `labmake <target>`
+# works for anything. cpen-nios only ever uses common.mk and niosv.mk.
+#
+# Derived from the Makefile distributed with CPEN 211 and rewritten for
+# Linux, with the GDB_CLIENT quoting bug fixed (see niosv.mk).
+
+HERE := $(dir $(lastword $(MAKEFILE_LIST)))
+
+include $(HERE)common.mk
+include $(HERE)niosv.mk
+include $(HERE)verilog.mk

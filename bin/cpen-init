@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+#
+# cpen-init - bring the board up from a cold start.
+#
+# Run this ON THE MAC, not inside the VM: `orb usb` is a host command, so
+# a process in the guest cannot re-attach its own passthrough.
+#
+#   cpen-init              full bring-up: attach USB, program, start servers
+#   cpen-init --no-program skip FPGA configuration (board kept its power)
+#   cpen-init --program    only stop holders, reprogram, restart them
+#   cpen-init --stop       stop the GDB server and terminal
+#   cpen-init --status     report what is running, change nothing
+#   cpen-init --no-gdb --no-terminal
+#                          attach + program only, leave the cable free
+#
+# Only ONE program may own the JTAG cable at a time. quartus_pgm needs it
+# exclusively, so nios2-terminal and the debug server are stopped before
+# programming and restarted afterwards. Skipping that gives:
+#   Error (209042): Application nios2-terminal ... is using the target device
+#
+set -uo pipefail
+
+# -P resolves symlinks, so a link in ~/.local/bin still finds the repo.
+HERE=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+CONFIG_FILE="${CPEN_TOOLS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/cpen-tools/config}"
+
+if [ ! -r "$CONFIG_FILE" ]; then
+  printf 'No config at %s\nRun this first:\n    %s/bin/cpen-setup\n' \
+    "$CONFIG_FILE" "$HERE" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "$CONFIG_FILE"
+
+: "${MACHINE:?set MACHINE in $CONFIG_FILE}"
+: "${INSTALL:=/opt/altera}"
+: "${QUARTUS_BIN:=$INSTALL/quartus/bin}"
+: "${GDBSRV:=$INSTALL/riscfree/debugger/gdbserver-riscv/ash-riscv-gdb-server}"
+: "${MAKEFILE:=$HERE/share/Makefile.linux}"
+: "${RUNDIR:=${XDG_STATE_HOME:-$HOME/.local/state}/cpen-tools}"
+: "${USB_VIDPID:=09fb:6001}"
+: "${GDB_PORT:=2454}"
+: "${TERM_INSTANCE:=0}"
+: "${BOARD:=}"
+: "${SOF:=}"
+: "${JTAG_INDEX:=1}"
+: "${IDCODE:=}"
+: "${CABLE:=}"
+
+JTAGCONFIG="$QUARTUS_BIN/jtagconfig"
+NIOS2_TERMINAL="$QUARTUS_BIN/nios2-terminal"
+GDB_INSTANCE=1
+
+DO_ATTACH=1; DO_PROGRAM=1; DO_GDB=1; DO_TERMINAL=1; MODE=init
+for a in "$@"; do
+  case "$a" in
+    --no-program)  DO_PROGRAM=0 ;;
+    --no-gdb)      DO_GDB=0 ;;
+    --no-terminal) DO_TERMINAL=0 ;;
+    --program)     MODE=program ;;
+    --stop)        MODE=stop ;;
+    --status)      MODE=status ;;
+    -h|--help)     sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $a (try --help)" >&2; exit 2 ;;
+  esac
+done
+
+step() { printf '\n\033[1;34m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
+ok()   { printf '    \033[32mok\033[0m   %s\n' "$*"; }
+warn() { printf '    \033[33mwarn\033[0m %s\n' "$*"; }
+die()  { printf '\n\033[1;31mFAILED\033[0m %s\n' "$*" >&2; exit 1; }
+
+# bash -lc does NOT source ~/.bashrc (Ubuntu returns early for
+# non-interactive shells), so `labmake` and the Altera PATH are NOT
+# available here - always use absolute paths.
+#
+# stdin MUST be /dev/null. Given a TTY, orb allocates a pty for the remote
+# command and negotiates terminal capabilities; backgrounded servers then
+# die when that session is torn down, and the escape sequences it emits
+# land in the caller's terminal.
+vm() { orb -m "$MACHINE" bash -lc "$*" < /dev/null; }
+
+# pgrep/pkill matching, both learned the hard way:
+#  * `pgrep -a NAME` silently matches nothing when NAME is >15 chars, which
+#    made ash-riscv-gdb-server look dead while it was live. Always use -f.
+#  * `pkill -f PATTERN` also matches the `bash -lc ...` wrapper carrying the
+#    pattern, so it kills its own shell. Bracketing one letter -- [j]tagd --
+#    stops the pattern matching its own text.
+HOLDER_PAT='[n]ios2-terminal|[a]sh-riscv-gdb-server|[o]penocd'
+
+start_machine() {
+  step "OrbStack machine '$MACHINE'"
+  command -v orb >/dev/null 2>&1 || die "'orb' is not on PATH. Is OrbStack installed?"
+  if orb list 2>/dev/null | awk -v m="$MACHINE" '$1==m && $2=="running"{f=1} END{exit !f}'; then
+    ok "already running"
+  else
+    open -ga OrbStack 2>/dev/null || true
+    orb start "$MACHINE" >/dev/null 2>&1 \
+      || die "could not start machine '$MACHINE'. Try: orb start $MACHINE"
+    ok "started"
+  fi
+  vm "mkdir -p '$RUNDIR'" >/dev/null 2>&1
+}
+
+attach_usb() {
+  step "USB-Blaster passthrough"
+  local id
+  id=$(orb usb list 2>/dev/null | awk -v p="$USB_VIDPID" '$2==p {print $1; exit}')
+  [ -n "$id" ] || die "no $USB_VIDPID device. Is the board plugged in and powered on?"
+
+  # Always detach first. After a physical unplug/replug OrbStack still
+  # reports "attached" while the VM sees nothing in lsusb -- the mapping is
+  # stale and only a detach/attach cycle rebuilds it.
+  orb usb detach "$id" >/dev/null 2>&1 || true
+  sleep 1
+  orb usb attach "$id" >/dev/null 2>&1 || die "orb usb attach $id failed"
+  sleep 2
+
+  vm "lsusb | grep -qi '$USB_VIDPID\\|altera'" \
+    || die "VM still cannot see the blaster. Power-cycle the board and re-run."
+  ok "attached (orb id $id) and visible to the VM"
+}
+
+stop_holders() {
+  vm "pkill -f '$HOLDER_PAT'" >/dev/null 2>&1 || true
+  sleep 1
+}
+
+chain_ok() {  # chain text on stdin
+  if [ -n "$IDCODE" ]; then grep -q "$IDCODE"; else grep -qE '^[[:space:]]*[0-9A-Fa-f]{8}[[:space:]]'; fi
+}
+
+reset_jtagd() {
+  step "JTAG chain"
+  local out
+  out=$(vm "'$JTAGCONFIG'" 2>&1)
+  if ! chain_ok <<<"$out"; then
+    # "JTAG chain broken" / "No JTAG hardware" after a replug is jtagd
+    # holding a handle to a device node that no longer exists. It respawns
+    # on the next jtagconfig.
+    warn "chain not readable, restarting jtagd"
+    vm "pkill -f 'linux64/[j]tagd'" >/dev/null 2>&1 || true
+    sleep 2
+    out=$(vm "'$JTAGCONFIG'" 2>&1)
+  fi
+  chain_ok <<<"$out" || die "no FPGA on the JTAG chain. jtagconfig said:\n$out"
+  ok "$(grep -oE '[0-9A-Fa-f]{8}[[:space:]]+[^[:space:]]+' <<<"$out" | tail -1)"
+}
+
+program_fpga() {
+  step "Programming the FPGA${BOARD:+ ($BOARD)}"
+  # Needed after the board loses power: configuration is volatile. Within a
+  # session you can COMPILE/RUN repeatedly without reprogramming.
+  #
+  # MAIN=none.s because the Makefile refuses to run when the current
+  # directory holds no lab .s file, even though PROGRAM never reads sources.
+  local out args
+  args="MAIN=none.s PROGRAM"
+  [ -n "$BOARD" ]      && args="$args BOARD='$BOARD'"
+  [ -n "$SOF" ]        && args="$args SOF='$SOF'"
+  [ -n "$JTAG_INDEX" ] && args="$args JTAG_INDEX='$JTAG_INDEX'"
+  out=$(vm "cd '$RUNDIR' && make -f '$MAKEFILE' INSTALL='$INSTALL' $args" 2>&1)
+  if grep -q "Configuration succeeded" <<<"$out"; then
+    ok "configuration succeeded"
+    return 0
+  fi
+  printf '%s\n' "$out" >&2
+  warn "quartus_pgm did not report success"
+  return 1
+}
+
+start_gdb() {
+  step "GDB server (port $GDB_PORT)"
+  [ -x "${GDBSRV:-/nonexistent}" ] || vm "[ -x '$GDBSRV' ]" || {
+    warn "no debug server at $GDBSRV - skipping"; return 1; }
+  vm "cd '$RUNDIR' && setsid nohup '$GDBSRV' --device auto-scan \
+        --gdb-port $GDB_PORT --instance $GDB_INSTANCE \
+        --probe-type USB-Blaster-2 --transport-type jtag --auto-detect true \
+        > '$RUNDIR/gdbserver.log' 2>&1 < /dev/null &" >/dev/null 2>&1
+  # Wait INSIDE the VM in one call. Polling from here spawned a fresh orb
+  # client per attempt (~120ms each), so the window was both slow and
+  # unreliable; the server needs seconds to scan the chain and find the hart.
+  if vm "for i in \$(seq 1 60); do ss -ltn | grep -q ':$GDB_PORT' && exit 0; \
+         sleep 0.5; done; exit 1" >/dev/null 2>&1; then
+    ok "listening on $GDB_PORT  (log: $RUNDIR/gdbserver.log)"
+    return 0
+  fi
+  warn "did not start listening. See $RUNDIR/gdbserver.log"
+  return 1
+}
+
+start_terminal() {
+  step "nios2-terminal"
+  vm "cd '$RUNDIR' && setsid nohup '$NIOS2_TERMINAL' --instance $TERM_INSTANCE \
+        > '$RUNDIR/terminal.log' 2>&1 < /dev/null &" >/dev/null 2>&1
+  if vm "for i in \$(seq 1 20); do pgrep -f '[n]ios2-terminal' >/dev/null \
+         && exit 0; sleep 0.5; done; exit 1" >/dev/null 2>&1; then
+    ok "running  (watch it with: tail -f $RUNDIR/terminal.log)"
+  else
+    warn "did not stay up. See $RUNDIR/terminal.log"
+  fi
+}
+
+show_status() {
+  step "Status"
+  printf '    board %s  index %s  cable %s\n' \
+    "${BOARD:-?}" "${JTAG_INDEX:-?}" "${CABLE:-<none>}"
+  orb list 2>/dev/null | grep -E "^(NAME|$MACHINE)" | sed 's/^/    /'
+  orb usb list 2>/dev/null | grep "$USB_VIDPID" | sed 's/^/    /' \
+    || echo "    (no $USB_VIDPID device)"
+  echo "    --- in the VM ---"
+  vm "lsusb | grep -i altera || echo '(blaster not visible)'" 2>&1 | sed 's/^/    /'
+  vm "'$JTAGCONFIG'" 2>&1 | sed 's/^/    /'
+  vm "pgrep -af '$HOLDER_PAT' | grep -v 'bash -lc' \
+        || echo '(gdb server and terminal both stopped)'" 2>&1 | sed 's/^/    /'
+  vm "ss -ltn | grep ':$GDB_PORT' || echo '(nothing listening on $GDB_PORT)'" \
+    2>&1 | sed 's/^/    /'
+}
+
+case "$MODE" in
+  status) show_status ;;
+
+  stop)
+    step "Stopping GDB server and terminal"
+    stop_holders
+    ok "cable is free"
+    ;;
+
+  program)
+    start_machine
+    step "Releasing the JTAG cable"
+    had_gdb=0;  vm "pgrep -f '[a]sh-riscv-gdb-server' >/dev/null" && had_gdb=1
+    had_term=0; vm "pgrep -f '[n]ios2-terminal' >/dev/null"        && had_term=1
+    stop_holders
+    ok "stopped (gdb=$had_gdb terminal=$had_term)"
+    reset_jtagd
+    if ! program_fpga; then
+      # Do not leave the student worse off than before: restore whatever
+      # was running when we took the cable away.
+      [ "$had_gdb"  = 1 ] && start_gdb
+      [ "$had_term" = 1 ] && start_terminal
+      die "programming failed; previous processes restored"
+    fi
+    [ "$had_gdb"  = 1 ] && start_gdb
+    [ "$had_term" = 1 ] && start_terminal
+    ;;
+
+  init)
+    start_machine
+    [ "$DO_ATTACH" = 1 ] && attach_usb
+    step "Releasing the JTAG cable"
+    stop_holders
+    ok "no process is holding it"
+    reset_jtagd
+    [ "$DO_PROGRAM"  = 1 ] && { program_fpga || die "could not configure the FPGA"; }
+    [ "$DO_GDB"      = 1 ] && start_gdb
+    [ "$DO_TERMINAL" = 1 ] && start_terminal
+    ;;
+esac
+
+if [ "$MODE" = init ] || [ "$MODE" = program ]; then
+  printf '\n\033[1;32mReady to compile.\033[0m\n'
+  cat <<EOF
+
+  From your lab directory, in the console or in the VM:
+
+      make -f $MAKEFILE COMPILE
+      make -f $MAKEFILE RUN
+
+  Watch program output:   tail -f $RUNDIR/terminal.log
+  Free the cable again:   $0 --stop
+  Reprogram later:        $0 --program
+EOF
+fi

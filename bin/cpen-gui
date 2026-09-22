@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+#
+# cpen-gui - run the Quartus and Questa interfaces inside the OrbStack VM
+#            and show them on the Mac over VNC.
+#
+#   cpen-gui             Quartus
+#   cpen-gui questa      Questa
+#   cpen-gui both        both, in two windows
+#   cpen-gui stop        shut both down     (or: stop quartus | stop questa)
+#   cpen-gui status      what is running
+#
+# Both start in the directory you run them from. If that directory holds a
+# Quartus project, Quartus opens it.
+#
+# The two run on separate virtual screens, at different sizes, because they
+# disagree about scaling:
+#
+#   Quartus is Qt. QT_SCALE_FACTOR enlarges its icons along with its text,
+#   so it gets a big screen (2560x1600) drawn at 2x and looks sharp.
+#
+#   Questa is Tcl/Tk. Its fonts come from ~/.modelsim and its toolbar icons
+#   are fixed-size bitmaps that nothing can scale. The only way to make them
+#   legible is to give it a small screen (1280x800) and let the viewer
+#   magnify the whole thing, which costs some sharpness.
+#
+# Each VNC server listens only on the VM's loopback, which OrbStack forwards
+# to the Mac's loopback, so nothing is exposed on any network. The password
+# is the one set with:  orb -m altera vncpasswd
+#
+set -uo pipefail
+
+MACHINE=${CPEN_VM:-altera}
+LICENCE=${SALT_LICENSE_SERVER:-$HOME/.config/cpen-tools/Questa_License.dat}
+
+QUARTUS_ARG=${CPEN_GUI_PROJECT:-}
+
+QUARTUS_DISP=${CPEN_QUARTUS_DISPLAY:-1}
+QUARTUS_GEOM=${CPEN_QUARTUS_GEOMETRY:-2560x1600}
+QUESTA_DISP=${CPEN_QUESTA_DISPLAY:-2}
+QUESTA_GEOM=${CPEN_QUESTA_GEOMETRY:-1280x800}
+
+vm()   { orb -m "$MACHINE" bash -c "$1" < /dev/null; }
+# vncserver's own listing, not pgrep: `pgrep -f Xtigervnc` matches the
+# wrapper command carrying the pattern and always reports a hit.
+live() { vm "vncserver -list 2>/dev/null | awk '\$1 == \"$1\"' | grep -q ." 2>/dev/null; }
+
+# Paths are relative to the VM's home and expanded there: a ~ inside a
+# quoted string sent through bash -c stays a literal tilde.
+put() {  # put <path-relative-to-home>, content on stdin
+  orb -m "$MACHINE" bash -c "mkdir -p \"\$HOME/.vnc\" && cat > \"\$HOME/$1\" && chmod +x \"\$HOME/$1\""
+}
+
+# Both tools start in the directory this was run from, like any other
+# command, so opening the GUI from a lab directory lands you in that lab.
+# Only /Users is shared with the VM, so anywhere else falls back to the VM's
+# own home rather than a folder the VM cannot see. The literal string $HOME
+# is passed through and expanded on the far side.
+resolve_workdir() {
+  case "${CPEN_GUI_DIR:-$PWD}" in
+    /Users/*) WORKDIR=${CPEN_GUI_DIR:-$PWD} ;;
+    *)        WORKDIR='$HOME'
+              echo "note: ${CPEN_GUI_DIR:-$PWD} is not shared with the VM;" \
+                   "starting in the VM's home instead" >&2 ;;
+  esac
+  # Quartus opens the project found here, if there is one.
+  if [ -z "$QUARTUS_ARG" ] && [ -d "$WORKDIR" ]; then
+    QUARTUS_ARG=$(find "$WORKDIR" -maxdepth 1 -name '*.qpf' -print -quit 2>/dev/null)
+  fi
+}
+
+write_sessions() {
+  # Built with unexpanded heredocs and piped in: quoting a heredoc through
+  # orb -> bash -c mangles every $ in it.
+  cat <<'XEOF' | sed -e "s|@LICENCE@|$LICENCE|" -e "s|@PROJECT@|$QUARTUS_ARG|" \
+                     -e "s|@WORKDIR@|$WORKDIR|" | put '.vnc/xstartup-quartus'
+#!/bin/sh
+# cpen-gui session v6 (quartus) - regenerated automatically, edits are lost
+export QUARTUS_ROOTDIR=/opt/altera/quartus
+export PATH="$QUARTUS_ROOTDIR/bin:/opt/altera/niosv/bin:$PATH"
+export SALT_LICENSE_SERVER=@LICENCE@
+# Scales icons as well as text. QT_FONT_DPI would scale only the text and
+# leave the toolbar unreadably small.
+export QT_SCALE_FACTOR=${CPEN_QT_SCALE:-2}
+unset SESSION_MANAGER DBUS_SESSION_BUS_ADDRESS
+cd "@WORKDIR@" 2>/dev/null || cd "$HOME"
+( sleep 2
+  quartus @PROJECT@ >/dev/null 2>&1 &
+  qpid=$!
+  # Five minutes, not eighty seconds. Quartus's first launch in a newly
+  # built VM is far slower than later ones - nothing is in the page cache
+  # yet - and the old loop gave up before the main window was ever mapped,
+  # leaving it floating at its default size with the desktop around it.
+  # Stops early if Quartus itself has gone, so a failed launch does not
+  # leave this spinning.
+  for i in $(seq 1 150); do
+    kill -0 $qpid 2>/dev/null || break
+    wmctrl -r 'Quartus Prime' -b add,maximized_vert,maximized_horz 2>/dev/null && break
+    sleep 2
+  done ) &
+# Openbox leads the session, not Quartus: exec'ing Quartus here would mean
+# quitting it takes the whole screen down.
+exec openbox
+XEOF
+
+  cat <<'XEOF' | sed -e "s|@LICENCE@|$LICENCE|" \
+                     -e "s|@WORKDIR@|$WORKDIR|" | put '.vnc/xstartup-questa'
+#!/bin/sh
+# cpen-gui session v6 (questa) - regenerated automatically, edits are lost
+export QUARTUS_ROOTDIR=/opt/altera/quartus
+export PATH="$QUARTUS_ROOTDIR/bin:/opt/altera/niosv/bin:$PATH"
+export SALT_LICENSE_SERVER=@LICENCE@
+unset SESSION_MANAGER DBUS_SESSION_BUS_ADDRESS
+# No font or DPI tweaking here on purpose. This screen is small and the
+# viewer magnifies it, so Questa's stock 12pt fonts and fixed-size icons
+# come out at the size they were drawn for.
+cd "@WORKDIR@" 2>/dev/null || cd "$HOME"
+# No maximise loop: Questa opens at the full screen size on its own here, and
+# it maps its main window before giving it a name, so wmctrl cannot find it
+# to resize anyway.
+( sleep 2; /opt/altera/questa_fse/linux_x86_64/vsim -gui >/dev/null 2>&1 & ) &
+exec openbox
+XEOF
+}
+
+start() {  # start <name> <disp> <geom> <script>
+  local name=$1 disp=$2 geom=$3 script=$4 port=$((5900 + $2))
+# TigerVNC moved the password file to the XDG location; Ubuntu 26.04
+# ships a version that writes ~/.config/tigervnc/passwd, while older ones
+# used ~/.vnc/passwd. Accept either, or a password that was set comes back
+# as "not set".
+VNC_PASSWD_TEST='[ -f "$HOME/.vnc/passwd" ] || '\
+'[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/tigervnc/passwd" ]'
+  if ! vm "$VNC_PASSWD_TEST"; then
+    echo "no VNC password set in the '$MACHINE' machine." >&2
+    echo "  Set one first (it is never stored by these tools):" >&2
+    echo "    orb -m $MACHINE vncpasswd" >&2
+    return 1
+  fi
+  if live "$disp"; then
+    echo "$name already running on :$disp"
+  else
+    echo "starting $name ($geom) on :$disp..."
+    vm "vncserver :$disp -geometry $geom -depth 24 -localhost yes \
+        -SecurityTypes VncAuth -xstartup \"\$HOME/$script\"" 2>&1 \
+      | grep -E "New Xtigervnc|rror" || true
+    live "$disp" || { echo "  failed; check: orb -m $MACHINE cat '~/.vnc/*:$disp.log'" >&2; return 1; }
+  fi
+  for _ in $(seq 1 20); do
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 && break
+    sleep 1
+  done
+  echo "  connecting to vnc://127.0.0.1:$port"
+  open "vnc://127.0.0.1:$port"
+}
+
+case "${1:-quartus}" in
+  stop)
+    case "${2:-all}" in
+      quartus) targets="$QUARTUS_DISP" ;;
+      questa)  targets="$QUESTA_DISP" ;;
+      *)       targets="$QUARTUS_DISP $QUESTA_DISP" ;;
+    esac
+    for d in $targets; do
+      live "$d" && { vm "vncserver -kill :$d" >/dev/null 2>&1; echo "stopped :$d"; } \
+                || echo ":$d not running"
+    done
+    exit 0 ;;
+  status)
+    for pair in "quartus $QUARTUS_DISP" "questa $QUESTA_DISP"; do
+      set -- $pair
+      if live "$2"; then
+        echo "$1: running on :$2  (vnc://127.0.0.1:$((5900 + $2)))"
+        wins=$(vm "DISPLAY=:$2 wmctrl -lG 2>/dev/null" 2>/dev/null)
+        if [ -n "$wins" ]; then
+          printf '%s\n' "$wins" | sed 's/^/    /'
+        else
+          # Questa maps its window before naming it, so wmctrl shows nothing.
+          vm "DISPLAY=:$2 xwininfo -root -children 2>/dev/null | grep -c 'x[0-9]*+' " 2>/dev/null \
+            | sed 's/^/    windows open (unnamed): /'
+        fi
+      else
+        echo "$1: not running"
+      fi
+    done
+    exit 0 ;;
+  -h|--help) sed -n '3,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+
+# Written every run, not cached: they carry the directory this was started
+# from, which is different every time.
+resolve_workdir
+write_sessions
+
+case "${1:-quartus}" in
+  quartus) start quartus "$QUARTUS_DISP" "$QUARTUS_GEOM" '.vnc/xstartup-quartus' ;;
+  questa)  start questa  "$QUESTA_DISP"  "$QUESTA_GEOM"  '.vnc/xstartup-questa' ;;
+  both)    start quartus "$QUARTUS_DISP" "$QUARTUS_GEOM" '.vnc/xstartup-quartus'
+           start questa  "$QUESTA_DISP"  "$QUESTA_GEOM"  '.vnc/xstartup-questa' ;;
+  *) echo "unknown: $1 (try --help)" >&2; exit 2 ;;
+esac
